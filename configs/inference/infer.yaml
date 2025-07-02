@@ -1,0 +1,136 @@
+experiment:
+    type: vggt_avatar
+    seed: 42
+    parent: vggt_avatar
+    child: vggt_avatar_8gpu
+
+model:
+    # image encoder
+    encoder_frozen: true
+    encoder_type: "dinov2_fusion"
+    encoder_model_name: "dinov2_vitl14_reg"
+    encoder_feat_dim: 1024
+    encoder_freeze: true
+
+    # points embeddings
+    pcl_frozen: true
+    num_pcl: 2048
+    pcl_dim: 1024
+
+    # transformer
+    frame_attn_frozen: false
+    encoder_grad_ckpt: true
+    transformer_dim: 1024
+    transformer_layers: 10
+    transformer_heads: 16
+    tf_grad_ckpt: true
+    pretrained_model_path: "./model_zoo/lam_models/releases/lam/lam-20k/step_045500/model.safetensors"
+    aa_order: ["frame", "global"]
+    aa_block_size: 1
+
+    # LoRA config for frame attn
+    lora_cfg:
+        r: 128
+        lora_alpha: 256
+        target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
+        lora_dropout: 0.0
+        bias: "none"
+        task_type: "FEATURE_EXTRACTION"
+
+    # for gs renderer
+    gs_frozen: true
+    human_model_path: "./model_zoo/human_parametric_models"
+    flame_subdivide_num: 1
+    flame_type: "flame"
+    gs_query_dim: 1024
+    gs_use_rgb: true
+    gs_sh: 3
+    gs_mlp_network_config:
+        n_neurons: 512
+        n_hidden_layers: 2
+        activation: "silu"
+    gs_xyz_offset_max_step: 0.2
+    gs_clip_scaling: 0.01
+    scale_sphere: false
+    
+    expr_param_dim: 10
+    shape_param_dim: 10
+    add_teeth: false
+
+    fix_opacity: false
+    fix_rotation: false
+
+    has_disc: false
+
+    teeth_bs_flag: false
+    oral_mesh_flag: false
+    flame_scale: 1.0
+
+dataset:
+    repeat_num: 1
+    root_dirs: "/mnt/Data/wuyue/nersemble_FLAME"
+    meta_path: "./datasets/nersemble_uids.json"
+    input_frames: 20
+    frames_per_sample: 40
+    render_image_res: 512
+    source_image_res: 512
+    render_image:
+        low: 512
+        high: 512
+        region: null
+    num_train_workers: 4
+    num_val_workers: 2
+    pin_mem: true
+
+train:
+    mixed_precision: bf16
+    find_unused_parameters: false
+    loss:
+        pixel_weight: 1.0
+        perceptual_weight: 1.0
+        tv_weight: -1
+        offset_weight: -1
+    optim:
+        lr: 1e-4
+        lora_lr: 1e-5
+        weight_decay: 0.05
+        beta1: 0.9
+        beta2: 0.95
+        clip_grad_norm: 1.0
+    scheduler:
+        type: cosine
+        warmup_real_iters: 500
+    batch_size: 1
+    accum_steps: 8
+    epochs: 50
+    debug_global_steps: null
+    resume: ""
+
+val:
+    batch_size: 2
+    global_step_period: 100
+    debug_batches: null
+
+saver:
+    auto_resume: true
+    load_model: null
+    checkpoint_root: "./exps/checkpoints"
+    checkpoint_global_steps: 100
+    checkpoint_keep_level: 3
+
+logger:
+    stream_level: INFO
+    log_level: INFO
+    log_root: "./exps/logs"
+    tracker_root: "./exps/trackers"
+    enable_profiler: false
+    trackers:
+        - tensorboard
+    image_monitor:
+        train_global_steps: 100
+        samples_per_log: 2
+
+compile:
+    suppress_errors: true
+    print_specializations: true
+    disable: true
