@@ -1,0 +1,1 @@
+from .vggt_avatar import VGGTAvatarInferrer

@@ -1,44 +1,65 @@
 experiment:
     type: vggt_avatar
     seed: 42
-    parent: vggt_avatar
-    child: vggt_avatar_8gpu
+    parent: fastavatar
+    child: fastavatar-multi-frame
 
-model:
+model: 
     # image encoder
-    encoder_frozen: true
     encoder_type: "dinov2_fusion"
     encoder_model_name: "dinov2_vitl14_reg"
     encoder_feat_dim: 1024
     encoder_freeze: true
 
     # points embeddings
-    pcl_frozen: true
     num_pcl: 2048
     pcl_dim: 1024
 
     # transformer
-    frame_attn_frozen: false
     encoder_grad_ckpt: true
     transformer_dim: 1024
     transformer_layers: 10
     transformer_heads: 16
     tf_grad_ckpt: true
-    pretrained_model_path: "./model_zoo/lam_models/releases/lam/lam-20k/step_045500/model.safetensors"
     aa_order: ["frame", "global"]
     aa_block_size: 1
+    post_fusion: false
+    
+    # Multi-frame control
+    use_multi_frame_pc: true
+    conf_loss_frames: 2  # Number of frames to use for confidence loss calculation
 
-    # LoRA config for frame attn
-    lora_cfg:
-        r: 128
-        lora_alpha: 256
-        target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
-        lora_dropout: 0.0
-        bias: "none"
-        task_type: "FEATURE_EXTRACTION"
+    # tracking and confidence switches
+    use_tracking: false  # Enable/disable tracking head
+    use_confidence: false  # Enable/disable confidence head
+
+    # tracking
+    intermediate_layer_idx: [2,4,6,8]
+
+    # FLAME token config
+    use_flame_tokens: true
+    flame_encoder_config:
+        # FLAME parameter dimensions (set to 0 to disable)
+        expr_dim: 100
+        rotation_dim: 3
+        neck_pose_dim: 3
+        jaw_pose_dim: 3
+        eyes_pose_dim: 6
+        translation_dim: 3
+
+        hidden_dim: 256  
+        output_dim: 1024
+        dropout: 0.0
+
+    # Camera token config
+    use_camera_tokens: true
+    camera_encoder_config:
+        hidden_dim: 256
+        output_dim: 1024
+        dropout: 0.0
 
     # for gs renderer
-    gs_frozen: true
+    num_sliced_frames: 8
     human_model_path: "./model_zoo/human_parametric_models"
     flame_subdivide_num: 1
     flame_type: "flame"
@@ -53,9 +74,19 @@ model:
     gs_clip_scaling: 0.01
     scale_sphere: false
     
+    # TriPlane config
+    use_triplane: false
+    triplane_config:
+        grid_dim: 2
+        in_dim: 3
+        out_dim: 32
+        resolution: [64, 64, 64]
+        a: 0.1
+        b: 0.5
+    
     expr_param_dim: 10
     shape_param_dim: 10
-    add_teeth: false
+    add_teeth: true
 
     fix_opacity: false
     fix_rotation: false
@@ -63,59 +94,69 @@ model:
     has_disc: false
 
     teeth_bs_flag: false
-    oral_mesh_flag: false
+    oral_mesh_flag: true
     flame_scale: 1.0
 
 dataset:
     repeat_num: 1
-    root_dirs: "/mnt/Data/wuyue/nersemble_FLAME"
-    meta_path: "./datasets/nersemble_uids.json"
-    input_frames: 20
-    frames_per_sample: 40
+    root_dirs: "/inspire/hdd/global_user/fengkairui-25026/wuyue/nersemble_FLAME"
+    meta_path: "./datasets/nersemble_uids_unified.json"
+    task_type: "unified"  # Options: "monocular", "multi-view", "unified"
+    input_frames: 16
+    frames_per_sample: 32
     render_image_res: 512
     source_image_res: 512
+    num_train_workers: 4
+    num_val_workers: 2
+    pin_mem: true
+    val_num: 160
     render_image:
         low: 512
         high: 512
         region: null
-    num_train_workers: 4
-    num_val_workers: 2
-    pin_mem: true
 
 train:
+    gradient_checkpointing: true
     mixed_precision: bf16
-    find_unused_parameters: false
+    find_unused_parameters: true
     loss:
-        pixel_weight: 1.0
-        perceptual_weight: 1.0
+        pixel_weight: 0.8
+        conf_weight: 1.0
+        perceptual_weight: 0.05
+        ssim_weight: 0.05
+        tracking_weight: 0.01
         tv_weight: -1
-        offset_weight: -1
+        conf_alpha: 0.2
     optim:
-        lr: 1e-4
-        lora_lr: 1e-5
+        global_attn_lr: 1e-4     # Global attention (random initialization)
+        other_lr: 4e-5           # All other parameters (pretrained models)
+        
         weight_decay: 0.05
         beta1: 0.9
         beta2: 0.95
         clip_grad_norm: 1.0
     scheduler:
         type: cosine
-        warmup_real_iters: 500
+        warmup_real_iters: 8000
     batch_size: 1
-    accum_steps: 8
+    accum_steps: 1
     epochs: 50
     debug_global_steps: null
     resume: ""
 
 val:
     batch_size: 2
-    global_step_period: 100
+    global_step_period: 500
     debug_batches: null
+    save_images: true
+    save_dir: "./exps/val_perf"
+    samples_per_save: 5
 
 saver:
     auto_resume: true
     load_model: null
     checkpoint_root: "./exps/checkpoints"
-    checkpoint_global_steps: 100
+    checkpoint_global_steps: 1000
     checkpoint_keep_level: 3
 
 logger:
@@ -127,7 +168,7 @@ logger:
     trackers:
         - tensorboard
     image_monitor:
-        train_global_steps: 100
+        train_global_steps: 999999
         samples_per_log: 2
 
 compile:

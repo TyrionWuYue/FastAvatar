@@ -24,4 +24,4 @@ chumpy
 loguru 
 ninja
 ffmpeg
-peft>=0.7.0
+megfile
