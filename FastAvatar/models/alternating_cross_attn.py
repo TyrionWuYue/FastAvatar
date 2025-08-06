@@ -21,7 +21,7 @@ from typing import Any, Dict, Tuple, List
 from diffusers.utils import is_torch_version
 from FastAvatar.models.block import BasicBlock, MemEffBasicBlock
 from FastAvatar.models.pos_embed import RoPE2D, get_1d_sincos_pos_embed_from_grid
-from FastAvatar.models.pose_encoder import FLAMEPoseEncoder, CameraPoseEncoder
+from FastAvatar.models.encoders.pose_encoder import FLAMEPoseEncoder, CameraPoseEncoder
 from FastAvatar.models.cross_attn import SD3JointTransformerBlock
 
 
@@ -47,7 +47,8 @@ class FrameAttn(nn.Module):
             SD3JointTransformerBlock(
                 dim=inner_dim,
                 num_heads=num_heads,
-                qk_norm="rms_norm"
+                qk_norm="rms_norm",
+                eps=eps
             )
             for _ in range(num_layers)
         ])

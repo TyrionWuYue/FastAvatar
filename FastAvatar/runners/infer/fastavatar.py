@@ -19,7 +19,6 @@ import torch
 import argparse
 import mcubes
 import json
-import trimesh
 import numpy as np
 from PIL import Image
 from glob import glob
@@ -55,18 +54,16 @@ def parse_configs():
         cfg.render_size = cfg_train.dataset.render_image.high
         _relative_path = os.path.join(cfg_train.experiment.parent, cfg_train.experiment.child)
 
-        cfg.save_tmp_dump = os.path.join("exps", 'save_tmp', _relative_path)
-        cfg.image_dump = os.path.join("exps", 'images', _relative_path)
-        cfg.video_dump = os.path.join("exps", 'videos', _relative_path)
-        cfg.mesh_dump = os.path.join("exps", 'meshes', _relative_path)
+        cfg.save_tmp_dump = os.path.join("infer_results", 'save_tmp', _relative_path)
+        cfg.image_dump = os.path.join("infer_results", 'images', _relative_path)
+        cfg.video_dump = os.path.join("infer_results", 'videos', _relative_path)
         
     if args.infer is not None:
         cfg_infer = OmegaConf.load(args.infer)
         cfg.merge_with(cfg_infer)
-        cfg.setdefault("save_tmp_dump", os.path.join("exps", cli_cfg.model_name, 'save_tmp'))
-        cfg.setdefault("image_dump", os.path.join("exps", cli_cfg.model_name, 'images'))
-        cfg.setdefault('video_dump', os.path.join("dumps", cli_cfg.model_name, 'videos'))
-        cfg.setdefault('mesh_dump', os.path.join("dumps", cli_cfg.model_name, 'meshes'))
+        cfg.setdefault("save_tmp_dump", os.path.join("infer_results", cli_cfg.model_name, 'save_tmp'))
+        cfg.setdefault("image_dump", os.path.join("infer_results", cli_cfg.model_name, 'images'))
+        cfg.setdefault('video_dump', os.path.join("infer_results", cli_cfg.model_name, 'videos'))
     
     cfg.merge_with(cli_cfg)
 
@@ -75,19 +72,15 @@ def parse_configs():
     model_name: str
     image_input: str
     export_video: bool
-    export_mesh: bool
 
     [special]
     source_size: int
     render_size: int
     video_dump: str
-    mesh_dump: str
 
     [default]
     render_views: int
     render_fps: int
-    mesh_size: int
-    mesh_thres: float
     frame_size: int
     logger: str
     """
@@ -98,8 +91,7 @@ def parse_configs():
     assert cfg.model_name is not None, "model_name is required"
     if not os.environ.get('APP_ENABLED', None):
         assert cfg.image_input is not None, "image_input is required"
-        assert cfg.export_video or cfg.export_mesh, \
-            "At least one of export_video or export_mesh should be True"
+        assert cfg.export_video, "export_video should be True"
         cfg.app_enabled = False
     else:
         cfg.app_enabled = True
@@ -117,7 +109,7 @@ class FastAvatarInferrer(Inferrer):
         
         self.cfg = parse_configs()
         self.model: FastAvatarInferrer = self._build_model(self.cfg).to(self.device)
-        self.flametracking = FlameTrackingMultiImage(output_dir='tracking_output',
+        self.flametracking = FlameTrackingMultiImage(output_dir='infer_results/tracking_output',
                                              alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
                                              vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
                                              human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
@@ -394,7 +386,6 @@ class FastAvatarInferrer(Inferrer):
 
         # Initialize lists to store processed data
         c2ws, rgbs, bg_colors, masks = [], [], [], []
-        flame_params = defaultdict(list)
 
         # Process input images using multi-image FLAME tracking
         print(f"\nProcessing input with multi-image FLAME tracking...")
@@ -425,8 +416,12 @@ class FastAvatarInferrer(Inferrer):
         print(f"Input FLAME parameters loaded successfully for {inference_N_frames} frames")
 
         # Load processed data from tracking output (same as training)
-        # processed_data is now at the same level as export directory
-        processed_data_dir = os.path.join(os.path.dirname(output_dir), 'processed_data')
+        # processed_data is inside the output directory
+        processed_data_dir = os.path.join(output_dir, 'processed_data')
+        print(f"Looking for processed_data at: {processed_data_dir}")
+        print(f"Directory exists: {os.path.exists(processed_data_dir)}")
+        if os.path.exists(processed_data_dir):
+            print(f"Directory contents: {os.listdir(processed_data_dir)}")
         
         if os.path.exists(processed_data_dir):
             print(f"Loading processed data from: {processed_data_dir}")
@@ -525,6 +520,10 @@ class FastAvatarInferrer(Inferrer):
         target_intrs = motion_seqs["intrs"]  # Already has batch dim [1, N_target, 4, 4] - for rendering
         
         # Stack input data from processed_data (following disorder_video_head.py pattern)
+        if not rgbs:
+            raise RuntimeError(f"No frames were successfully loaded. rgbs list is empty. processed_data_dir: {processed_data_dir}")
+        
+        print(f"Successfully loaded {len(rgbs)} frames")
         rgbs = torch.cat(rgbs, dim=0)  # [N_input, 3, H, W]
         rgbs = rgbs.unsqueeze(0)  # [1, N_input, 3, H, W]
         masks = torch.cat(masks, dim=0)  # [N_input, 1, H, W]
@@ -653,14 +652,6 @@ class FastAvatarInferrer(Inferrer):
         rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
         only_pred = rgb
 
-        if self.cfg.get("vis_motion", False):
-            # vis_ref_img = np.tile(cv2.resize(vis_ref_img, (rgb[0].shape[1], rgb[0].shape[0]), interpolation=cv2.INTER_AREA)[None, :, :, :], (rgb.shape[0], 1, 1, 1))
-            interpolation = get_smart_interpolation(vis_ref_img.shape[:2], (rgb[0].shape[0], rgb[0].shape[1]))
-            vis_ref_img = np.tile(cv2.resize(vis_ref_img, (rgb[0].shape[1], rgb[0].shape[0]), interpolation=interpolation)[None, :, :, :], (rgb.shape[0], 1, 1, 1))
-            blend_ratio = 0.7
-            blend_res = ((1 - blend_ratio) * rgb + blend_ratio * motion_seqs["vis_motion_render"]).astype(np.uint8)
-            rgb = np.concatenate([vis_ref_img, rgb, motion_seqs["vis_motion_render"]], axis=2)
-
         # Save results
         print("\nSaving results...")
         if os.path.isfile(self.cfg.image_input) and self.cfg.image_input.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
@@ -676,11 +667,9 @@ class FastAvatarInferrer(Inferrer):
         dump_video_path = os.path.join(self.cfg.video_dump, f'{uid}.mp4')
         dump_image_dir = os.path.join(self.cfg.image_dump, f'{uid}')
         dump_tmp_dir = os.path.join(self.cfg.image_dump, "tmp_res")
-        dump_mesh_path = os.path.join(self.cfg.mesh_dump)
         
         os.makedirs(dump_image_dir, exist_ok=True)
         os.makedirs(dump_tmp_dir, exist_ok=True)
-        os.makedirs(dump_mesh_path, exist_ok=True)
 
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
         self.save_imgs_2_video(rgb, dump_video_path, self.cfg.render_fps)
@@ -701,40 +690,4 @@ class FastAvatarInferrer(Inferrer):
                 save_file = os.path.join(dump_image_dir, f"{i:04d}.png")
                 Image.fromarray(only_pred[i]).save(save_file)
 
-                if self.cfg.get("save_ply", False) and dump_mesh_path is not None:
-                    res["3dgs"][i][0][0].save_ply(os.path.join(dump_image_dir, f"{i:04d}.ply"))
-
-            # Save canonical mesh
-            dump_cano_dir = "./exps/cano_gs/"
-            os.makedirs(dump_cano_dir, exist_ok=True)
-            
-            # Save canonical point cloud
-            cano_ply_pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + "_gs_offset.ply")
-            res['cano_gs_lst'][0].save_ply(cano_ply_pth, rgb2sh=False, offset2xyz=True)
-            print(f"Canonical point cloud saved to: {cano_ply_pth}")
-
-            # Save canonical mesh
-            import trimesh
-            vtxs = res['cano_gs_lst'][0].xyz - res['cano_gs_lst'][0].offset
-            vtxs = vtxs.detach().cpu().numpy()
-            faces = self.model.renderer.flame_model.faces.detach().cpu().numpy()
-            mesh = trimesh.Trimesh(vertices=vtxs, faces=faces)
-            mesh.export(os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_shaped_mesh.obj'))
-            print(f"Canonical mesh saved to: {os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_shaped_mesh.obj')}")
-
-            # Save textured mesh
-            import FastAvatar.models.rendering.utils.mesh_utils as mesh_utils
-            vtxs = res['cano_gs_lst'][0].xyz.detach().cpu()
-            faces = self.model.renderer.flame_model.faces.detach().cpu()
-            colors = res['cano_gs_lst'][0].shs.squeeze(1).detach().cpu()
-            pth = os.path.join(dump_cano_dir, os.path.basename(dump_image_dir) + '_textured_mesh.obj')
-            mesh_utils.save_obj(pth, vtxs, faces, textures=colors, texture_type="vertex")
-            print(f"Textured mesh saved to: {pth}")
-
         print("\nInference and saving completed successfully!")
-
-def get_smart_interpolation(src_size, dst_size):
-    if src_size[0] < dst_size[0] or src_size[1] < dst_size[1]:
-        return cv2.INTER_CUBIC
-    else:
-        return cv2.INTER_AREA

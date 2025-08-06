@@ -85,13 +85,9 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
         with open(transforms_path, 'r') as f:
             transforms_data = json.load(f)
         
-        # Load all landmarks for all frames
-        landmark_data = np.load(landmark_path)
-        all_landmarks = landmark_data['face_landmark_2d']  # (num_frames, 68, 3)
-        all_visibility = landmark_data['visibility']       # (num_frames, 68)
         
-        # Create processed_data directory at the same level as export
-        processed_data_dir = os.path.join(frame_dir, 'processed_data')
+        # Create processed_data directory inside the export directory
+        processed_data_dir = os.path.join(frame_dir, 'export', 'processed_data')
         os.makedirs(processed_data_dir, exist_ok=True)
         
         # Process each image using the corresponding landmarks
@@ -120,7 +116,6 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
                 
                 # 1. Load image
                 rgb = np.array(Image.open(img_path))
-                interpolation = cv2.INTER_AREA
                 rgb = rgb / 255.0
                 
                 # 2. Process mask
@@ -159,10 +154,15 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
                 new_h = (new_h // multiply) * multiply
                 new_w = (new_w // multiply) * multiply
                 
-                # Final resize
-                rgb = cv2.resize(rgb, dsize=(new_w, new_h), interpolation=interpolation)
-                mask = cv2.resize(mask, dsize=(new_w, new_h), interpolation=interpolation)
+                rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
+                mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (H, W) -> (1, H, W)
                 
+                rgb_resized = torchvision.transforms.functional.resize(rgb_tensor, (new_h, new_w), antialias=True)
+                mask_resized = torchvision.transforms.functional.resize(mask_tensor, (new_h, new_w), antialias=True)
+                
+                rgb = rgb_resized.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
+                mask = mask_resized.squeeze(0).numpy()  # (1, H, W) -> (H, W)
+
                 # Update ratios for intrinsic matrix
                 ratio_y = new_h / current_h
                 ratio_x = new_w / current_w

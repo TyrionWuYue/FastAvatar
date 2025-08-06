@@ -359,7 +359,6 @@ class ModelFastAvatar(nn.Module):
 
         query_points, _ = self.renderer.get_query_points(input_flame_params, device=input_image.device)
         assert query_points.shape[1] == N_input, "Query points should be [B, N_input, N_points, 3]"
-        # query_points = query_points[:, :1].repeat(1, N_input, 1, 1) # [B, N_input, N_points, 3] anchor the first frame
         
         # Construct camera parameters dictionary for input frames
         camera_params = {
@@ -571,10 +570,7 @@ class ModelFastAvatar(nn.Module):
         print(f"[INFER] Render resolution: {render_h}x{render_w}")
         
         # Step 1: Get query points
-        query_points_start = time.time()
         query_points, _ = self.renderer.get_query_points(input_flame_params, device=image.device)
-        query_points_time = time.time() - query_points_start
-        print(f"[INFER] get_query_points: {query_points_time:.3f}s")
         
         # Step 2: Forward latent points (most expensive step)
         latent_points_start = time.time()
@@ -658,7 +654,7 @@ class ModelFastAvatar(nn.Module):
                 print(f"[INFER] Single input frame mode")
 
         gs_start = time.time()
-        batch_flame_params['betas'] = batch_flame_params['betas'][:, :1]
+
         gs_model_list, curr_query_points, curr_flame_params, _ = self.renderer.forward_gs(
             gs_hidden_features=latent_points, 
             query_points=query_points, 
@@ -689,10 +685,7 @@ class ModelFastAvatar(nn.Module):
         # Store timing information in output
         out = render_res
         out['total_render_time'] = total_render_time
-        out['gs_time'] = gs_time
-        out['animate_time'] = animate_time
         
-        combine_start = time.time()
         out = render_res
         if "comp_rgb" in out and isinstance(out["comp_rgb"], torch.Tensor):
             # Reshape if needed: [B, Nv, 3, H, W] -> [Nv, H, W, 3]
@@ -706,7 +699,5 @@ class ModelFastAvatar(nn.Module):
                 out["comp_depth"] = out["comp_depth"][0].permute(0, 2, 3, 1)
         
         out['cano_gs_lst'] = gs_model_list
-        combine_time = time.time() - combine_start
-        print(f"[INFER] result_combining: {combine_time:.3f}s")
         
         return out
