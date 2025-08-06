@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd
 
-from VGGTAvatar.models.rendering.utils.typing import *
+from FastAvatar.models.rendering.utils.typing import *
 
 def get_activation(name):
     if name is None:

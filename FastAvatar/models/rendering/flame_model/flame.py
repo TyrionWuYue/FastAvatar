@@ -17,8 +17,8 @@
 # Contact: ps-license@tuebingen.mpg.de
 
 
-from VGGTAvatar.models.rendering.flame_model.lbs import lbs, vertices2landmarks, blend_shapes, vertices2joints
-from VGGTAvatar.models.rendering.flame_model.lbs import batch_rigid_transform, batch_rodrigues
+from FastAvatar.models.rendering.flame_model.lbs import lbs, vertices2landmarks, blend_shapes, vertices2joints
+from FastAvatar.models.rendering.flame_model.lbs import batch_rigid_transform, batch_rodrigues
 
 import os
 import json
@@ -37,8 +37,8 @@ except ImportError:
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import SubdivideMeshes
 from einops import rearrange, repeat
-from VGGTAvatar.models.rendering.utils.mesh_utils import compute_face_normals, compute_face_orientation
-from VGGTAvatar.models.rendering.utils.uv_utils import (
+from FastAvatar.models.rendering.utils.mesh_utils import compute_face_normals, compute_face_orientation
+from FastAvatar.models.rendering.utils.uv_utils import (
     gen_tritex,
     uniform_sampling_barycoords,
     reweight_uvcoords_by_barycoords,
@@ -51,7 +51,7 @@ from pytorch3d.transforms import (
     quaternion_multiply,
 )
 import functools
-from VGGTAvatar.models.rendering.gaussian_model import GaussianModel
+from FastAvatar.models.rendering.gaussian_model import GaussianModel
 import torch.nn.functional as F
 
 

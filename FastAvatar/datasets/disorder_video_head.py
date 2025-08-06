@@ -5,8 +5,8 @@ import torch
 import json
 import random
 
-from VGGTAvatar.datasets.base import FrameBaseDataset
-from VGGTAvatar.utils.proxy import no_proxy
+from FastAvatar.datasets.base import FrameBaseDataset
+from FastAvatar.utils.proxy import no_proxy
 from typing import Optional, Union
 
 __all__ = ['DisorderVideoHeadDataset']

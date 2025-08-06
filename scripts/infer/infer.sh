@@ -46,7 +46,7 @@ if_multi_frames_compare=false
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
 # Run inference
-CUDA_VISIBLE_DEVICES=$device python -m VGGTAvatar.launch infer.vggt_avatar \
+CUDA_VISIBLE_DEVICES=$device python -m FastAvatar.launch infer.fastavatar \
     --config $TRAIN_CONFIG \
     model_name=$MODEL_NAME \
     image_input=$IMAGE_INPUT \

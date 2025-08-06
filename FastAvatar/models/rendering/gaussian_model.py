@@ -6,8 +6,8 @@ import torch.nn.functional as F
 import numpy as np
 import math
 import copy
-from VGGTAvatar.models.rendering.utils.typing import *
-from VGGTAvatar.models.rendering.utils.utils import trunc_exp, MLP
+from FastAvatar.models.rendering.utils.typing import *
+from FastAvatar.models.rendering.utils.utils import trunc_exp, MLP
 from einops import rearrange, repeat
 
 
@@ -87,7 +87,7 @@ class GaussianModel:
         f_dc = features_dc.detach().flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = features_rest.detach().flatten(start_dim=1).contiguous().cpu().numpy()
         if rgb2sh:
-            from VGGTAvatar.models.rendering.utils.sh_utils import RGB2SH
+            from FastAvatar.models.rendering.utils.sh_utils import RGB2SH
             f_dc = RGB2SH(f_dc)
         opacities = inverse_sigmoid(torch.clamp(self.opacity, 1e-3, 1 - 1e-3).detach().cpu().float().numpy())
         scale = np.log(self.scaling.detach().cpu().float().numpy())
@@ -113,7 +113,7 @@ class GaussianModel:
         f_dc = features_dc.detach().flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = features_rest.detach().flatten(start_dim=1).contiguous().cpu().numpy()
         if rgb2sh:
-            from VGGTAvatar.models.rendering.utils.sh_utils import RGB2SH
+            from FastAvatar.models.rendering.utils.sh_utils import RGB2SH
             f_dc = RGB2SH(f_dc)
         opacities = self.opacity.detach().cpu().float().numpy()
         scale = self.scaling.detach().cpu().float().numpy()
@@ -164,7 +164,7 @@ class GaussianModel:
         self.xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cpu").requires_grad_(False))
         self.features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cpu").transpose(1, 2).contiguous().requires_grad_(False))
         if sh2rgb:
-            from VGGTAvatar.models.rendering.utils.sh_utils import SH2RGB
+            from FastAvatar.models.rendering.utils.sh_utils import SH2RGB
             self.features_dc = SH2RGB(self.features_dc)
         self.features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cpu").transpose(1, 2).contiguous().requires_grad_(False))
         self.shs = torch.cat([self.features_dc, self.features_rest], dim=1)

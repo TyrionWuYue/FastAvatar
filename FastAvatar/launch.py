@@ -16,12 +16,12 @@
 
 import argparse
 
-from VGGTAvatar.runners import REGISTRY_RUNNERS
+from FastAvatar.runners import REGISTRY_RUNNERS
 
 
 def main():
 
-    parser = argparse.ArgumentParser(description="VGGTAvatar Launcher")
+    parser = argparse.ArgumentParser(description="FastAvatar Launcher")
     parser.add_argument('runner', type=str, help='Runner to launch')
     args, unknown = parser.parse_known_args()
 

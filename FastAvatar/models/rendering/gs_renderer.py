@@ -24,12 +24,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from VGGTAvatar.models.rendering.flame_model.flame import FlameHeadSubdivided
+from FastAvatar.models.rendering.flame_model.flame import FlameHeadSubdivided
 from pytorch3d.transforms import matrix_to_quaternion
-from VGGTAvatar.models.rendering.utils.typing import *
-from VGGTAvatar.models.rendering.utils.utils import trunc_exp, MLP
-from VGGTAvatar.models.rendering.gaussian_model import GaussianModel
-from VGGTAvatar.models.rendering.utils.triplane_utils import TriPlaneNetwork
+from FastAvatar.models.rendering.utils.typing import *
+from FastAvatar.models.rendering.utils.utils import trunc_exp, MLP
+from FastAvatar.models.rendering.gaussian_model import GaussianModel
+from FastAvatar.models.rendering.utils.triplane_utils import TriPlaneNetwork
 from einops import rearrange, repeat
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 

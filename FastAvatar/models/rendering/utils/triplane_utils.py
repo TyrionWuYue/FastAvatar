@@ -3,7 +3,7 @@ import itertools
 import torch.nn as nn
 from torch.nn import functional as F
 from einops import rearrange
-from VGGTAvatar.models.rendering.utils.tilted_utils import So3
+from FastAvatar.models.rendering.utils.tilted_utils import So3
 
 relu = torch.nn.ReLU()
 

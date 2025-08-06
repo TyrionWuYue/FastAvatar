@@ -1,5 +1,5 @@
 experiment:
-    type: vggt_avatar
+    type: fastavatar
     seed: 42
     parent: fastavatar
     child: fastavatar-multi-frame
@@ -28,13 +28,6 @@ model:
     # Multi-frame control
     use_multi_frame_pc: true
     conf_loss_frames: 2  # Number of frames to use for confidence loss calculation
-
-    # tracking and confidence switches
-    use_tracking: false  # Enable/disable tracking head
-    use_confidence: false  # Enable/disable confidence head
-
-    # tracking
-    intermediate_layer_idx: [2,4,6,8]
 
     # FLAME token config
     use_flame_tokens: true

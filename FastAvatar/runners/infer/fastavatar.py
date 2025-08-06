@@ -107,10 +107,10 @@ def parse_configs():
     return cfg
 
 
-@REGISTRY_RUNNERS.register(name="infer.vggt_avatar")
+@REGISTRY_RUNNERS.register(name="infer.fastavatar")
 class FastAvatarInferrer(Inferrer):
 
-    EXP_TYPE = "vggt_avatar"
+    EXP_TYPE = "fastavatar"
 
     def __init__(self):
         super().__init__()

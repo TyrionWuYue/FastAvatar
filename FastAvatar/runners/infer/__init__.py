@@ -1,1 +1,1 @@
-from .vggt_avatar import VGGTAvatarInferrer
+from .fastavatar import FastAvatarInferrer
