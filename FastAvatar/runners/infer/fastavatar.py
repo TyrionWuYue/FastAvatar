@@ -34,6 +34,7 @@ from FastAvatar.runners.infer.base_inferrer import Inferrer
 from FastAvatar.datasets.cam_utils import build_camera_principle, build_camera_standard, surrounding_views_linspace, create_intrinsics
 from FastAvatar.runners import REGISTRY_RUNNERS
 from FastAvatar.runners.infer.flame_tracking_multi_image import FlameTrackingMultiImage
+from FastAvatar.runners.infer.flame_tracking_single_image import FlameTrackingSingleImage
 
 logger = get_logger(__name__)
 
@@ -87,6 +88,7 @@ def parse_configs():
 
     cfg.setdefault('logger', 'INFO')
     cfg.setdefault('max_single_frame_render', 8)  # Default max frames for single frame rendering
+    cfg.setdefault('mode', 'Monocular')  # Default mode: Monocular or MultiView
     # assert not (args.config is not None and args.infer is not None), "Only one of config and infer should be provided"
     assert cfg.model_name is not None, "model_name is required"
     if not os.environ.get('APP_ENABLED', None):
@@ -109,13 +111,29 @@ class FastAvatarInferrer(Inferrer):
         
         self.cfg = parse_configs()
         self.model: FastAvatarInferrer = self._build_model(self.cfg).to(self.device)
-        self.flametracking = FlameTrackingMultiImage(output_dir='infer_results/tracking_output',
-                                             alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
-                                             vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
-                                             human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
-                                             facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
-                                             detect_iris_landmarks=True,
-                                             args = self.cfg)
+        
+        # Initialize tracking based on mode
+        self.mode = self.cfg.get('mode', 'Monocular')
+        print(f"Initializing FastAvatar inference in {self.mode} mode")
+        
+        if self.mode == 'MultiView':
+            # For MultiView mode, use single image tracking
+            self.flametracking = FlameTrackingSingleImage(output_dir='infer_results/tracking_output',
+                                                 alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
+                                                 vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
+                                                 human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
+                                                 facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
+                                                 detect_iris_landmarks=True,
+                                                 args = self.cfg)
+        else:
+            # For Monocular mode, use multi-image tracking
+            self.flametracking = FlameTrackingMultiImage(output_dir='infer_results/tracking_output',
+                                                 alignment_model_path='./model_zoo/flame_tracking_models/68_keypoints_model.pkl',
+                                                 vgghead_model_path='./model_zoo/flame_tracking_models/vgghead/vgg_heads_l.trcd',
+                                                 human_matting_path='./model_zoo/flame_tracking_models/matting/stylematte_synth.pt',
+                                                 facebox_model_path='./model_zoo/flame_tracking_models/FaceBoxesV2.pth',
+                                                 detect_iris_landmarks=True,
+                                                 args = self.cfg)
 
     def _build_model(self, cfg):
         from FastAvatar.models.modeling_FastAvatar import ModelFastAvatar
@@ -317,6 +335,167 @@ class FastAvatarInferrer(Inferrer):
         print(f"Loaded FLAME parameters for {num_frames} frames")
         return flame_params
         
+    def process_monocular_input(self, input_path, inference_N_frames):
+        """Process input using multi-image FLAME tracking (Monocular mode)"""
+        # Create temporary directory for tracking
+        tracking_output_dir = os.path.join(self.cfg.save_tmp_dump, 'input_tracking')
+        
+        # Clean existing tracking output to avoid conflicts
+        if os.path.exists(tracking_output_dir):
+            import shutil
+            shutil.rmtree(tracking_output_dir)
+            print(f"Cleaned existing tracking output directory: {tracking_output_dir}")
+        
+        os.makedirs(tracking_output_dir, exist_ok=True)
+        
+        # Run multi-image FLAME tracking
+        return_code = self.flametracking.preprocess(input_path, max_frames=inference_N_frames)
+        assert (return_code == 0), "flametracking preprocess failed!"
+        return_code = self.flametracking.optimize()
+        assert (return_code == 0), "flametracking optimize failed!"
+        return_code, output_dir = self.flametracking.export()
+        assert (return_code == 0), "flametracking export failed!"
+        
+        return output_dir
+
+    def process_multiview_input(self, input_path, inference_N_frames):
+        """Process input using single image FLAME tracking for each view (MultiView mode)"""
+        # Create temporary directory for tracking
+        tracking_output_dir = os.path.join(self.cfg.save_tmp_dump, 'input_tracking_multiview')
+        
+        # Clean existing tracking output to avoid conflicts
+        if os.path.exists(tracking_output_dir):
+            import shutil
+            shutil.rmtree(tracking_output_dir)
+            print(f"Cleaned existing tracking output directory: {tracking_output_dir}")
+        
+        os.makedirs(tracking_output_dir, exist_ok=True)
+        
+        # Get all image files from input path
+        if os.path.isfile(input_path):
+            image_files = [input_path]
+        else:
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff']
+            image_files = []
+            for ext in image_extensions:
+                image_files.extend(glob(os.path.join(input_path, ext)))
+                image_files.extend(glob(os.path.join(input_path, ext.upper())))
+            image_files = sorted(image_files)
+        
+        if not image_files:
+            raise ValueError(f"No image files found in {input_path}")
+        
+        # Limit number of frames if specified
+        if inference_N_frames is not None and len(image_files) > inference_N_frames:
+            image_files = image_files[:inference_N_frames]
+            print(f"Limited to {inference_N_frames} frames (out of {len(image_files)} total)")
+        
+        print(f"Processing {len(image_files)} images in MultiView mode")
+        
+        # Process each image individually using single image tracking
+        all_flame_params = []
+        all_camera_params = []
+        
+        for i, image_file in enumerate(image_files):
+            print(f"Processing image {i+1}/{len(image_files)}: {os.path.basename(image_file)}")
+            
+            # Update output directory for this view
+            view_output_dir = os.path.join(tracking_output_dir, f'view_{i:03d}')
+            self.flametracking.output_dir = view_output_dir
+            self.flametracking.output_preprocess = os.path.join(view_output_dir, 'preprocess')
+            self.flametracking.output_tracking = os.path.join(view_output_dir, 'tracking')
+            self.flametracking.output_export = os.path.join(view_output_dir, 'export')
+            
+            # Process single image
+            return_code = self.flametracking.preprocess(image_file)
+            if return_code != 0:
+                print(f"Warning: Failed to preprocess image {image_file}, skipping...")
+                continue
+                
+            return_code = self.flametracking.optimize()
+            if return_code != 0:
+                print(f"Warning: Failed to optimize image {image_file}, skipping...")
+                continue
+                
+            return_code, export_dir = self.flametracking.export()
+            if return_code != 0:
+                print(f"Warning: Failed to export image {image_file}, skipping...")
+                continue
+            
+            # Load FLAME parameters for this view
+            view_flame_params = self.load_input_flame_params(export_dir, 1)  # Single frame
+            all_flame_params.append(view_flame_params)
+            
+            # Load camera parameters for this view
+            view_intrs, view_c2ws = self.load_input_camera_params(export_dir, 1)  # Single frame
+            all_camera_params.append((view_intrs, view_c2ws))
+        
+        if not all_flame_params:
+            raise RuntimeError("No images were successfully processed")
+        
+        # Combine all views into a single output directory
+        combined_output_dir = os.path.join(tracking_output_dir, 'combined')
+        os.makedirs(combined_output_dir, exist_ok=True)
+        
+        # Combine FLAME parameters from all views
+        combined_flame_params = {}
+        for key in all_flame_params[0].keys():
+            combined_flame_params[key] = torch.cat([params[key] for params in all_flame_params], dim=1)
+        
+        # Save combined FLAME parameters
+        flame_param_dir = os.path.join(combined_output_dir, 'flame_param')
+        os.makedirs(flame_param_dir, exist_ok=True)
+        
+        # Save canonical shape (use first view's shape)
+        canonical_shape = combined_flame_params['betas'][0, 0]  # [300]
+        np.savez(os.path.join(combined_output_dir, 'canonical_flame_param.npz'), shape=canonical_shape.numpy())
+        
+        # Save per-frame FLAME parameters
+        for i in range(combined_flame_params['betas'].shape[1]):
+            frame_params = {k: v[0, i] for k, v in combined_flame_params.items()}
+            np.savez(os.path.join(flame_param_dir, f'{i:05d}.npz'), **{k: v.numpy() for k, v in frame_params.items()})
+        
+        # Combine camera parameters
+        combined_intrs = torch.cat([intrs for intrs, _ in all_camera_params], dim=1)  # [1, N_views, 4, 4]
+        combined_c2ws = torch.cat([c2ws for _, c2ws in all_camera_params], dim=1)    # [1, N_views, 4, 4]
+        
+        # Create transforms.json for combined views
+        transforms_data = {
+            'camera_angle_x': 0.6911112070083618,
+            'frames': []
+        }
+        
+        for i in range(combined_intrs.shape[1]):
+            intr = combined_intrs[0, i]
+            c2w = combined_c2ws[0, i]
+            
+            # Convert back to OpenGL convention for transforms.json
+            c2w_gl = c2w.clone()
+            c2w_gl[:3, 1:3] *= -1
+            
+            frame_data = {
+                'file_path': f'./images/{i:05d}.png',
+                'fl_x': float(intr[0, 0]),
+                'fl_y': float(intr[1, 1]),
+                'cx': float(intr[0, 2]),
+                'cy': float(intr[1, 2]),
+                'transform_matrix': c2w_gl.tolist()
+            }
+            transforms_data['frames'].append(frame_data)
+        
+        # Save transforms.json
+        with open(os.path.join(combined_output_dir, 'transforms.json'), 'w') as f:
+            json.dump(transforms_data, f, indent=2)
+        
+        # Copy processed data from first view (they should be similar)
+        first_view_export = os.path.join(tracking_output_dir, 'view_000', 'export')
+        if os.path.exists(first_view_export):
+            import shutil
+            shutil.copytree(first_view_export, os.path.join(combined_output_dir, 'export'), dirs_exist_ok=True)
+        
+        print(f"Successfully combined {len(all_flame_params)} views into {combined_output_dir}")
+        return combined_output_dir
+
     def load_input_camera_params(self, tracking_output_dir, N_input):
         """Load camera parameters for input frames from tracking output"""
         transforms_path = os.path.join(tracking_output_dir, 'transforms.json')
@@ -387,27 +566,13 @@ class FastAvatarInferrer(Inferrer):
         # Initialize lists to store processed data
         c2ws, rgbs, bg_colors, masks = [], [], [], []
 
-        # Process input images using multi-image FLAME tracking
-        print(f"\nProcessing input with multi-image FLAME tracking...")
-        
-        # Create temporary directory for tracking
-        tracking_output_dir = os.path.join(self.cfg.save_tmp_dump, 'input_tracking')
-        
-        # Clean existing tracking output to avoid conflicts
-        if os.path.exists(tracking_output_dir):
-            import shutil
-            shutil.rmtree(tracking_output_dir)
-            print(f"Cleaned existing tracking output directory: {tracking_output_dir}")
-        
-        os.makedirs(tracking_output_dir, exist_ok=True)
-        
-        # Run multi-image FLAME tracking
-        return_code = self.flametracking.preprocess(input_path, max_frames=inference_N_frames)
-        assert (return_code == 0), "flametracking preprocess failed!"
-        return_code = self.flametracking.optimize()
-        assert (return_code == 0), "flametracking optimize failed!"
-        return_code, output_dir = self.flametracking.export()
-        assert (return_code == 0), "flametracking export failed!"
+        # Process input images based on mode
+        if self.mode == 'MultiView':
+            print(f"\nProcessing input with MultiView mode using single image FLAME tracking...")
+            output_dir = self.process_multiview_input(input_path, inference_N_frames)
+        else:
+            print(f"\nProcessing input with Monocular mode using multi-image FLAME tracking...")
+            output_dir = self.process_monocular_input(input_path, inference_N_frames)
 
         print(f"FLAME tracking completed. Output directory: {output_dir}")
         
@@ -495,7 +660,7 @@ class FastAvatarInferrer(Inferrer):
         print(f"Preparing motion sequences from: {self.cfg.motion_seqs_dir}")
         motion_seqs = prepare_motion_seqs(
             motion_seqs_dir=self.cfg.motion_seqs_dir,
-            image_folder=self.cfg.motion_img_dir,
+            image_folder=None,
             save_root=self.cfg.save_tmp_dump,
             fps=self.cfg.motion_video_read_fps,
             bg_color=1.0,
@@ -585,36 +750,6 @@ class FastAvatarInferrer(Inferrer):
             
             print(f"Input frame count: {input_frame_count}")
             print(f"Max single frame render: {max_single_frame_render}")
-            
-            if self.cfg.get("if_multi_frames_compare", True):
-                # Determine how many frames to render for single frame comparison
-                single_frame_count = min(input_frame_count, max_single_frame_render)
-                print(f"Rendering {single_frame_count} frames for single frame comparison")
-                
-                single_frame_start_time = time.time()
-                for i in range(single_frame_count):
-                    # For single frame inference, index the corresponding FLAME parameters
-                    frame_input_flame_params = {}
-                    for k, v in input_flame_params.items():
-                        frame_input_flame_params[k] = v[:, i:i+1]  # [1, 1, ...]
-                    
-                    res = self.model.infer_images(
-                        rgbs[:, i:i+1],
-                        input_c2ws[:, i:i+1],
-                        input_intrs[:, i:i+1],
-                        target_c2ws,
-                        target_intrs,
-                        target_bg_colors,
-                        input_flame_params=frame_input_flame_params,
-                        inf_flame_params=inf_flame_params
-                    )
-                    frame_results.append(res["comp_rgb"].detach().cpu().numpy())
-                
-                single_frame_total_time = time.time() - single_frame_start_time
-                single_frame_avg_time = single_frame_total_time / single_frame_count
-                print(f"Single frame rendering completed:")
-                print(f"  - Total time: {single_frame_total_time:.2f} seconds")
-                print(f"  - Average time per frame: {single_frame_avg_time:.2f} seconds")
                 
             # Multi-frame inference
             multi_frame_start_time = time.time()
@@ -683,8 +818,8 @@ class FastAvatarInferrer(Inferrer):
             self.add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
             print(f"Audio added to video: {dump_video_path_wa}")
 
-        # Save individual frames if requested
-        if self.cfg.get("save_img", False) and dump_image_dir is not None:
+        # Save individual frames (disabled by default)
+        if False and dump_image_dir is not None:
             print("\nSaving individual frames...")
             for i in range(rgb.shape[0]):
                 save_file = os.path.join(dump_image_dir, f"{i:04d}.png")

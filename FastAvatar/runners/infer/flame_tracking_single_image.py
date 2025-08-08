@@ -3,6 +3,7 @@ import json
 import os
 import time
 from pathlib import Path
+import glob
 
 import cv2
 import numpy as np
@@ -25,6 +26,178 @@ from vhap.model.tracker import GlobalTracker
 
 # Define error codes for various processing failures.
 ERROR_CODE = {'FailedToDetect': 1, 'FailedToOptimize': 2, 'FailedToExport': 3}
+
+
+def calc_new_tgt_size_by_aspect(cur_hw, aspect_standard, tgt_size, multiply):
+    """Calculate new target size that is divisible by multiply.
+    
+    Args:
+        cur_hw: Current height and width tuple (h, w)
+        aspect_standard: Target aspect ratio (h/w)
+        tgt_size: Target size
+        multiply: Number that the final size should be divisible by
+        
+    Returns:
+        tuple: (new_height, new_width), ratio_y, ratio_x
+    """
+    assert abs(cur_hw[0] / cur_hw[1] - aspect_standard) < 0.03
+    tgt_size = tgt_size * aspect_standard, tgt_size
+    tgt_size = int(tgt_size[0] / multiply) * multiply, int(tgt_size[1] / multiply) * multiply
+    ratio_y, ratio_x = tgt_size[0] / cur_hw[0], tgt_size[1] / cur_hw[1]
+    return tgt_size, ratio_y, ratio_x
+
+
+def process_data_augmentation_single_image(frame_dir, aspect_standard=1.0, render_tgt_size=512, multiply=14):
+    """Apply data augmentation to get final dataset-ready data for single image."""
+    try:
+        # Debug: Log the actual frame_dir value
+        logger.info(f'process_data_augmentation_single_image called with frame_dir: {frame_dir}')
+        
+        # Load the processed images from export directory
+        images_dir = os.path.join(frame_dir, 'export', 'images')
+        if not os.path.exists(images_dir):
+            logger.warning(f'Images directory not found: {images_dir}')
+            return False
+        
+        # Get all image files
+        image_files = sorted(glob.glob(os.path.join(images_dir, '*.png')))
+        if not image_files:
+            logger.warning(f'No image files found in {images_dir}')
+            return False
+        
+        # Landmark2d data is stored in the preprocess directory
+        landmark_dir = os.path.join(frame_dir, 'preprocess', 'landmark2d')
+        if not os.path.exists(landmark_dir):
+            logger.warning(f'Landmark2d directory not found: {landmark_dir}')
+            return False
+        
+        # For single image processing, we use the landmarks.npz file
+        landmark_path = os.path.join(landmark_dir, 'landmarks.npz')
+        if not os.path.exists(landmark_path):
+            logger.warning(f'Landmarks file not found: {landmark_path}')
+            return False
+        
+        transforms_path = os.path.join(frame_dir, 'export', 'transforms.json')
+        if not os.path.exists(transforms_path):
+            logger.warning(f'Transforms.json not found: {transforms_path}')
+            return False
+        with open(transforms_path, 'r') as f:
+            transforms_data = json.load(f)
+        
+        
+        # Create processed_data directory inside the export directory
+        processed_data_dir = os.path.join(frame_dir, 'export', 'processed_data')
+        os.makedirs(processed_data_dir, exist_ok=True)
+        
+        # Process each image using the corresponding landmarks
+        for frame_idx, img_path in enumerate(image_files):
+            try:
+                logger.info(f'Processing frame {frame_idx + 1}/{len(image_files)}')
+                
+                # Create frame-specific directory
+                frame_dir_name = f'{frame_idx:05d}'
+                frame_save_dir = os.path.join(processed_data_dir, frame_dir_name)
+                os.makedirs(frame_save_dir, exist_ok=True)
+                
+                # Get frame data from transforms
+                if frame_idx < len(transforms_data['frames']):
+                    frame_data = transforms_data['frames'][frame_idx]
+                else:
+                    # Use first frame data if not enough frames in transforms
+                    frame_data = transforms_data['frames'][0]
+                
+                intr = torch.eye(4)
+                intr[0, 0] = frame_data["fl_x"]
+                intr[1, 1] = frame_data["fl_y"]
+                intr[0, 2] = frame_data["cx"]
+                intr[1, 2] = frame_data["cy"]
+                intr = intr.float()
+                
+                # 1. Load image
+                rgb = np.array(Image.open(img_path))
+                rgb = rgb / 255.0
+                
+                # 2. Process mask
+                mask_path = os.path.join(frame_dir, 'export', 'mask', f'{frame_idx:05d}.png')
+                if os.path.exists(mask_path):
+                    mask = np.array(Image.open(mask_path)) > 180
+                    if len(mask.shape) == 3:
+                        mask = mask[..., 0]
+                else:
+                    mask = (rgb >= 0.99).sum(axis=2) == 3
+                    mask = np.logical_not(mask)
+                    mask = (mask * 255).astype(np.uint8)
+                    kernel_size, iterations = 3, 7
+                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+                    mask = cv2.erode(mask, kernel, iterations=iterations) / 255.0
+                
+                if len(mask.shape) > 2:
+                    mask = mask[:, :, 0]
+                mask = (mask > 0.5).astype(np.float32)
+                
+                # 3. Apply background color (fixed white for inference)
+                bg_color = 1.0  # Fixed white background
+                rgb = rgb[:, :, :3] * mask[:, :, None] + bg_color * (1 - mask[:, :, None])
+                
+                # 4. Resize to render_tgt_size for training (no cropping to preserve intrinsics)
+                # For 1024x1024 input, we need to resize to the target size
+                current_h, current_w = rgb.shape[:2]
+                logger.info(f'Current image size: {current_h}x{current_w}, target size: {render_tgt_size}')
+                
+                # Calculate resize ratio
+                ratio = render_tgt_size / max(current_h, current_w)
+                new_h = int(current_h * ratio)
+                new_w = int(current_w * ratio)
+                
+                # Ensure the new size is divisible by multiply
+                new_h = (new_h // multiply) * multiply
+                new_w = (new_w // multiply) * multiply
+                
+                rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
+                mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (H, W) -> (1, H, W)
+                
+                rgb_resized = torchvision.transforms.functional.resize(rgb_tensor, (new_h, new_w), antialias=True)
+                mask_resized = torchvision.transforms.functional.resize(mask_tensor, (new_h, new_w), antialias=True)
+                
+                rgb = rgb_resized.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
+                mask = mask_resized.squeeze(0).numpy()  # (1, H, W) -> (H, W)
+
+                # Update ratios for intrinsic matrix
+                ratio_y = new_h / current_h
+                ratio_x = new_w / current_w
+                
+                # Update intrinsic matrix
+                intr[0, 0] *= ratio_x
+                intr[1, 1] *= ratio_y
+                intr[0, 2] *= ratio_x
+                intr[1, 2] *= ratio_y
+                
+                # Ensure RGB values are in [0, 1] range after resize
+                rgb = np.clip(rgb, 0.0, 1.0)
+                mask = np.clip(mask, 0.0, 1.0)
+                
+                # Convert to torch tensors
+                rgb = torch.from_numpy(rgb).float().permute(2, 0, 1)  # [3, H, W]
+                mask = torch.from_numpy(mask).float().unsqueeze(0)    # [1, H, W]
+                
+                # Save processed data
+                np.save(os.path.join(frame_save_dir, 'rgb.npy'), rgb.numpy())
+                np.save(os.path.join(frame_save_dir, 'mask.npy'), mask.numpy())
+                np.save(os.path.join(frame_save_dir, 'intrs.npy'), intr.numpy())
+                np.save(os.path.join(frame_save_dir, 'bg_color.npy'), np.array(bg_color))
+                
+                logger.info(f'Frame {frame_idx} processed and saved to {frame_save_dir}')
+                
+            except Exception as e:
+                logger.error(f'Error processing frame {frame_idx}: {e}')
+                continue
+        
+        logger.info(f'Data augmentation completed for {len(image_files)} frames')
+        return True
+        
+    except Exception as e:
+        logger.error(f'Error in process_data_augmentation_single_image: {e}')
+        return False
 
 
 def expand_bbox(bbox, scale=1.1):
@@ -76,6 +249,7 @@ class FlameTrackingSingleImage:
         self.output_tracking = os.path.join(output_dir, 'tracking')
         self.output_export = os.path.join(output_dir, 'export')
         self.device = 'cuda:0'
+        self.args = args
 
         # Load alignment model
         assert os.path.exists(
@@ -187,6 +361,13 @@ class FlameTrackingSingleImage:
         output_mask_dir = os.path.join(self.sub_output_dir, 'mask')
         output_alpha_map_dir = os.path.join(self.sub_output_dir, 'alpha_maps')
 
+        # Clean existing directories to ensure we only have the frames we want
+        import shutil
+        for dir_path in [output_image_dir, output_mask_dir, output_alpha_map_dir]:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
+                logger.info(f'Cleaned existing directory: {dir_path}')
+
         os.makedirs(output_image_dir, exist_ok=True)
         os.makedirs(output_mask_dir, exist_ok=True)
         os.makedirs(output_alpha_map_dir, exist_ok=True)
@@ -246,30 +427,35 @@ class FlameTrackingSingleImage:
         start_time = time.time()
         logger.info('Starting Optimization...')
 
-        tyro.extras.set_accent_color('bright_yellow')
-        from yaml import safe_load, safe_dump
-        with open("configs/vhap_tracking/base_tracking_config.yaml", 'r') as yml_f:
-            config_data = safe_load(yml_f)
-        config_data = tyro.from_yaml(BaseTrackingConfig, config_data)
+        try:
+            tyro.extras.set_accent_color('bright_yellow')
+            from yaml import safe_load, safe_dump
+            with open("configs/vhap_tracking/base_tracking_config.yaml", 'r') as yml_f:
+                config_data = safe_load(yml_f)
+            config_data = tyro.from_yaml(BaseTrackingConfig, config_data)
 
-        config_data.data.sequence = self.sub_output_dir.split('/')[-1]
-        config_data.data.root_folder = Path(
-            os.path.dirname(self.sub_output_dir))
+            config_data.data.sequence = self.sub_output_dir.split('/')[-1]
+            config_data.data.root_folder = Path(
+                os.path.dirname(self.sub_output_dir))
 
-        if not os.path.exists(self.sub_output_dir):
-            logger.error(f'Failed to load {self.sub_output_dir}')
+            if not os.path.exists(self.sub_output_dir):
+                logger.error(f'Failed to load {self.sub_output_dir}')
+                return ERROR_CODE['FailedToOptimize']
+
+            config_data.exp.output_folder = Path(self.output_tracking)
+            tracker = GlobalTracker(config_data)
+            tracker.optimize()
+
+            end_time = time.time()
+            torch.cuda.empty_cache()
+            logger.info(
+                f'Finished Optimization. Time: {end_time - start_time:.2f}s')
+
+            return 0
+        except Exception as e:
+            logger.error(f'Error in optimization: {e}')
+            torch.cuda.empty_cache()
             return ERROR_CODE['FailedToOptimize']
-
-        config_data.exp.output_folder = Path(self.output_tracking)
-        tracker = GlobalTracker(config_data)
-        tracker.optimize()
-
-        end_time = time.time()
-        torch.cuda.empty_cache()
-        logger.info(
-            f'Finished Optimization. Time: {end_time - start_time:.2f}s')
-
-        return 0
 
     def _detect_iris_landmarks(self, image_path):
         """Detect iris landmarks in the given image."""
@@ -325,30 +511,52 @@ class FlameTrackingSingleImage:
         """Export the tracking results to configured folder."""
         logger.info(f'Beginning export from {self.output_tracking}')
         start_time = time.time()
-        if not os.path.exists(self.output_tracking):
-            logger.error(f'Failed to load {self.output_tracking}')
+        
+        try:
+            if not os.path.exists(self.output_tracking):
+                logger.error(f'Failed to load {self.output_tracking}')
+                return ERROR_CODE['FailedToExport'], 'Failed'
+
+            src_folder = Path(self.output_tracking)
+            tgt_folder = Path(self.output_export,
+                              self.sub_output_dir.split('/')[-1])
+            src_folder, config_data = load_config(src_folder)
+
+            nerf_writer = NeRFDatasetWriter(config_data.data, tgt_folder, None,
+                                            None, 'white')
+            nerf_writer.write()
+
+            flame_writer = TrackedFLAMEDatasetWriter(config_data.model,
+                                                     src_folder,
+                                                     tgt_folder,
+                                                     mode='param',
+                                                     epoch=-1)
+            flame_writer.write()
+
+            split_json(tgt_folder)
+
+            # Apply data augmentation to get final dataset-ready data
+            logger.info('Applying data augmentation...')
+            aspect_standard = 1.0
+            render_tgt_size = 512
+            multiply = 14
+            
+            if hasattr(self, 'args') and self.args is not None:
+                if hasattr(self.args, 'source_size'):
+                    render_tgt_size = self.args.source_size
+                if hasattr(self.args, 'render_size'):
+                    render_tgt_size = self.args.render_size
+            
+            # Pass the output directory (parent of export) so process_data_augmentation can find preprocess
+            # and create processed_data at the same level as export
+            process_data_augmentation_single_image(str(self.output_dir), aspect_standard, render_tgt_size, multiply)
+
+            end_time = time.time()
+            torch.cuda.empty_cache()
+            logger.info(f'Finished Export. Time: {end_time - start_time:.2f}s')
+
+            return 0, str(tgt_folder)
+        except Exception as e:
+            logger.error(f'Error in export: {e}')
+            torch.cuda.empty_cache()
             return ERROR_CODE['FailedToExport'], 'Failed'
-
-        src_folder = Path(self.output_tracking)
-        tgt_folder = Path(self.output_export,
-                          self.sub_output_dir.split('/')[-1])
-        src_folder, config_data = load_config(src_folder)
-
-        nerf_writer = NeRFDatasetWriter(config_data.data, tgt_folder, None,
-                                        None, 'white')
-        nerf_writer.write()
-
-        flame_writer = TrackedFLAMEDatasetWriter(config_data.model,
-                                                 src_folder,
-                                                 tgt_folder,
-                                                 mode='param',
-                                                 epoch=-1)
-        flame_writer.write()
-
-        split_json(tgt_folder)
-
-        end_time = time.time()
-        torch.cuda.empty_cache()
-        logger.info(f'Finished Export. Time: {end_time - start_time:.2f}s')
-
-        return 0, str(tgt_folder)
