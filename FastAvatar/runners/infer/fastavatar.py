@@ -17,17 +17,15 @@ import traceback
 import time
 import torch
 import argparse
-import mcubes
 import json
+import shutil
 import numpy as np
 from PIL import Image
 from glob import glob
 from omegaconf import OmegaConf
-from tqdm.auto import tqdm
 from safetensors.torch import load_file
 from accelerate.logging import get_logger
 from collections import defaultdict
-import cv2
 
 from FastAvatar.runners.infer.head_utils import prepare_motion_seqs, preprocess_image, load_flame_params
 from FastAvatar.runners.infer.base_inferrer import Inferrer
@@ -89,6 +87,10 @@ def parse_configs():
     cfg.setdefault('logger', 'INFO')
     cfg.setdefault('max_single_frame_render', 8)  # Default max frames for single frame rendering
     cfg.setdefault('mode', 'Monocular')  # Default mode: Monocular or MultiView
+    # Safe defaults for runtime options
+    cfg.setdefault('render_fps', 30)
+    cfg.setdefault('motion_video_read_fps', 7.5)
+    cfg.setdefault('export_video', True)
     # assert not (args.config is not None and args.infer is not None), "Only one of config and infer should be provided"
     assert cfg.model_name is not None, "model_name is required"
     if not os.environ.get('APP_ENABLED', None):
@@ -182,14 +184,6 @@ class FastAvatarInferrer(Inferrer):
         render_cameras = build_camera_standard(render_camera_extrinsics, render_camera_intrinsics)
         return render_cameras.unsqueeze(0).repeat(batch_size, 1, 1)
     
-    def add_audio_to_video(self, video_path, out_path, audio_path):
-        from moviepy.editor import VideoFileClip, AudioFileClip
-        video_clip = VideoFileClip(video_path)
-        audio_clip = AudioFileClip(audio_path)
-        video_clip_with_audio = video_clip.set_audio(audio_clip)
-        video_clip_with_audio.write_videofile(out_path, codec='libx264', audio_codec='aac')
-        print(f"Audio added successfully at {out_path}")
-    
     def save_imgs_2_video(self, img_lst, v_pth, fps):
         from moviepy.editor import ImageSequenceClip
         images = [image.astype(np.uint8) for image in img_lst]
@@ -282,72 +276,80 @@ class FastAvatarInferrer(Inferrer):
             print(f"Error extracting frames from video: {e}")
             raise
     
-    def load_input_flame_params(self, tracking_output_dir, inference_N_frames=None):
-        """Load FLAME parameters from multi-image tracking output"""
+    def load_input_flame_params(self, tracking_output_dir, inference_N_frames=None, mode: str = 'Monocular'):
+        """Load FLAME parameters in a symmetric, mode-aware way.
+        Steps (both modes):
+          1) Load canonical betas (shape)
+          2) Collect per-frame file list
+          3) Load per-frame params (exclude 'shape'), stack to [N_input, ...]
+          4) Set betas to [N_input, 300]
+          5) Unsqueeze batch dim -> [1, N_input, ...]
+        """
         flame_params = defaultdict(list)
-        print(tracking_output_dir)
-        # Load canonical FLAME parameters
-        canonical_flame_path = os.path.join(tracking_output_dir, 'canonical_flame_param.npz')
-        if os.path.exists(canonical_flame_path):
-            canonical_params = np.load(canonical_flame_path)
-            # Use canonical shape for all frames
-            canonical_shape = torch.FloatTensor(canonical_params['shape'])
+
+        # 1) Load canonical betas (shape)
+        if mode == 'MultiView':
+            canonical_flame_path = os.path.join(
+                tracking_output_dir, '00000', 'export', '00000', 'canonical_flame_param.npz'
+            )
         else:
-            print(f"Warning: Canonical FLAME parameters not found at {canonical_flame_path}")
-            # Use default shape if canonical not available
-            canonical_shape = torch.zeros(300)
-        
-        # Load per-frame FLAME parameters
-        flame_param_dir = os.path.join(tracking_output_dir, 'flame_param')
-        if not os.path.exists(flame_param_dir):
-            raise FileNotFoundError(f"FLAME parameter directory not found at {flame_param_dir}. Tracking may have failed.")
-        
-        flame_param_files = sorted(glob(os.path.join(flame_param_dir, '*.npz')))
-        if not flame_param_files:
-            raise FileNotFoundError(f"No FLAME parameter files found in {flame_param_dir}")
-        
-        print(f"Found {len(flame_param_files)} FLAME parameter files")
-        
-        # If inference_N_frames is specified, only load the first N frames
-        original_count = len(flame_param_files)
-        if inference_N_frames is not None and len(flame_param_files) > inference_N_frames:
-            flame_param_files = flame_param_files[:inference_N_frames]
-            print(f"Using first {inference_N_frames} FLAME parameter files (out of {original_count} total)")
-        
-        for flame_file in flame_param_files:
-            frame_params = load_flame_params(flame_file)
-            for k, v in frame_params.items():
-                if k != 'shape':  # shape is handled by canonical params
+            canonical_flame_path = os.path.join(tracking_output_dir, 'canonical_flame_param.npz')
+        canonical_params = np.load(canonical_flame_path)
+        canonical_shape = torch.FloatTensor(canonical_params['shape'])
+
+        # 2) Collect per-frame file list
+        if mode == 'MultiView':
+            view_dirs = [
+                d for d in os.listdir(tracking_output_dir)
+                if d.isdigit() and os.path.isdir(os.path.join(tracking_output_dir, d))
+            ]
+            view_dirs = sorted(view_dirs, key=lambda x: int(x))
+            if inference_N_frames is not None and len(view_dirs) > inference_N_frames:
+                view_dirs = view_dirs[:inference_N_frames]
+            frame_files = [
+                os.path.join(tracking_output_dir, v, 'export', v, 'flame_param', '00000.npz')
+                for v in view_dirs
+            ]
+        else:
+            flame_param_dir = os.path.join(tracking_output_dir, 'flame_param')
+            if not os.path.exists(flame_param_dir):
+                raise FileNotFoundError(
+                    f"FLAME parameter directory not found at {flame_param_dir}. Tracking may have failed."
+                )
+            frame_files = sorted(glob(os.path.join(flame_param_dir, '*.npz')))
+            if not frame_files:
+                raise FileNotFoundError(f"No FLAME parameter files found in {flame_param_dir}")
+            if inference_N_frames is not None and len(frame_files) > inference_N_frames:
+                original_count = len(frame_files)
+                frame_files = frame_files[:inference_N_frames]
+                print(f"Using first {inference_N_frames} FLAME parameter files (out of {original_count} total)")
+
+        # 3) Load per-frame params (exclude 'shape') -> lists
+        for fpath in frame_files:
+            if not os.path.exists(fpath):
+                print(f"Warning: missing flame param file: {fpath}")
+                continue
+            frame_dict = load_flame_params(fpath)
+            for k, v in frame_dict.items():
+                if k != 'shape':
                     flame_params[k].append(v)
-        
-        # Stack all parameters to match training format: [N_frames, ...]
+
+        #    Stack to tensors [N_input, ...]
         for k in flame_params:
-            flame_params[k] = torch.stack(flame_params[k])  # [N_frames, ...]
-        
-        # Use canonical shape for all frames: [N_frames, 300]
-        num_frames = len(flame_param_files)
-        flame_params['betas'] = canonical_shape.expand(num_frames, -1)  # [N_frames, 300]
-        
-        # Add batch dimension to match training format: [1, N_frames, ...]
+            flame_params[k] = torch.stack(flame_params[k]) if len(flame_params[k]) > 0 else torch.empty(0)
+
+        # 4) Canonical betas -> [N_input, 300]
+        n_input = len(frame_files)
+        flame_params['betas'] = canonical_shape.expand(n_input, -1)
+
+        # 5) Add batch dimension -> [1, N_input, ...]
         for k in flame_params:
-            flame_params[k] = flame_params[k].unsqueeze(0)  # [1, N_frames, ...]
-        
-        print(f"Loaded FLAME parameters for {num_frames} frames")
+            flame_params[k] = flame_params[k].unsqueeze(0)
+
         return flame_params
         
     def process_monocular_input(self, input_path, inference_N_frames):
         """Process input using multi-image FLAME tracking (Monocular mode)"""
-        # Create temporary directory for tracking
-        tracking_output_dir = os.path.join(self.cfg.save_tmp_dump, 'input_tracking')
-        
-        # Clean existing tracking output to avoid conflicts
-        if os.path.exists(tracking_output_dir):
-            import shutil
-            shutil.rmtree(tracking_output_dir)
-            print(f"Cleaned existing tracking output directory: {tracking_output_dir}")
-        
-        os.makedirs(tracking_output_dir, exist_ok=True)
-        
         # Run multi-image FLAME tracking
         return_code = self.flametracking.preprocess(input_path, max_frames=inference_N_frames)
         assert (return_code == 0), "flametracking preprocess failed!"
@@ -356,19 +358,33 @@ class FastAvatarInferrer(Inferrer):
         return_code, output_dir = self.flametracking.export()
         assert (return_code == 0), "flametracking export failed!"
         
+        tracking_output_dir = os.path.dirname(output_dir)
+        processed_root = os.path.dirname(tracking_output_dir)
+        processed_data_dir = os.path.join(processed_root, 'processed_data')
+        os.makedirs(processed_data_dir, exist_ok=True)
+
+        src_transforms = os.path.join(output_dir, 'transforms.json')
+        dst_transforms = os.path.join(processed_data_dir, 'transforms.json')
+        if os.path.exists(src_transforms):
+            shutil.copyfile(src_transforms, dst_transforms)
+
+        src_canon = os.path.join(output_dir, 'canonical_flame_param.npz')
+        dst_canon = os.path.join(processed_data_dir, 'canonical_flame_param.npz')
+        if os.path.exists(src_canon):
+            shutil.copyfile(src_canon, dst_canon)
+
         return output_dir
 
     def process_multiview_input(self, input_path, inference_N_frames):
         """Process input using single image FLAME tracking for each view (MultiView mode)"""
-        # Create temporary directory for tracking
-        tracking_output_dir = os.path.join(self.cfg.save_tmp_dump, 'input_tracking_multiview')
-        
-        # Clean existing tracking output to avoid conflicts
-        if os.path.exists(tracking_output_dir):
-            import shutil
-            shutil.rmtree(tracking_output_dir)
-            print(f"Cleaned existing tracking output directory: {tracking_output_dir}")
-        
+        # Base directory for multiview tracking outputs (sibling to save_tmp), named exactly 'tracking_output'
+        norm_save_tmp = os.path.normpath(self.cfg.save_tmp_dump)
+        parts = norm_save_tmp.split(os.sep)
+        assert 'save_tmp' in parts, f"Expected 'save_tmp' in save_tmp_dump path: {self.cfg.save_tmp_dump}"
+        idx = parts.index('save_tmp')
+        base = os.sep.join(parts[:idx])
+        # Put views directly under tracking_output (no extra nested levels)
+        tracking_output_dir = os.path.join(base, 'tracking_output')
         os.makedirs(tracking_output_dir, exist_ok=True)
         
         # Get all image files from input path
@@ -392,15 +408,11 @@ class FastAvatarInferrer(Inferrer):
         
         print(f"Processing {len(image_files)} images in MultiView mode")
         
-        # Process each image individually using single image tracking
-        all_flame_params = []
-        all_camera_params = []
-        
         for i, image_file in enumerate(image_files):
             print(f"Processing image {i+1}/{len(image_files)}: {os.path.basename(image_file)}")
             
-            # Update output directory for this view
-            view_output_dir = os.path.join(tracking_output_dir, f'view_{i:03d}')
+            # Update output directory for this view (numeric, 5 digits to match monocular)
+            view_output_dir = os.path.join(tracking_output_dir, f'{i:05d}')
             self.flametracking.output_dir = view_output_dir
             self.flametracking.output_preprocess = os.path.join(view_output_dir, 'preprocess')
             self.flametracking.output_tracking = os.path.join(view_output_dir, 'tracking')
@@ -421,80 +433,61 @@ class FastAvatarInferrer(Inferrer):
             if return_code != 0:
                 print(f"Warning: Failed to export image {image_file}, skipping...")
                 continue
-            
-            # Load FLAME parameters for this view
-            view_flame_params = self.load_input_flame_params(export_dir, 1)  # Single frame
-            all_flame_params.append(view_flame_params)
-            
-            # Load camera parameters for this view
-            view_intrs, view_c2ws = self.load_input_camera_params(export_dir, 1)  # Single frame
-            all_camera_params.append((view_intrs, view_c2ws))
+
+        processed_data_dir = os.path.join(base, 'processed_data')
+        os.makedirs(processed_data_dir, exist_ok=True)
+
+        for i in range(len(image_files)):
+            curr_frame_dir = os.path.join(processed_data_dir, f'{i:05d}')
+            curr_frame_data_dir = os.path.join(tracking_output_dir, f'{i:05d}', 'processed_data', '00000')
+            os.makedirs(curr_frame_dir, exist_ok=True)
+
+            for fname in ['rgb.npy', 'mask.npy', 'intrs.npy', 'bg_color.npy']:
+                src = os.path.join(curr_frame_data_dir, fname)
+                dst = os.path.join(curr_frame_dir, fname)
+                if os.path.isfile(src):
+                    shutil.copyfile(src, dst)
+                else:
+                    print(f"Warning: missing source file: {src}")
+
+        # Build combined transforms.json for multiview in monocular-like format
+        try:
+            combined_frames = []
+            top_level = {}
+            for i in range(len(image_files)):
+                src_tjson = os.path.join(tracking_output_dir, f'{i:05d}', 'export', f'{i:05d}', 'transforms.json')
+                if not os.path.exists(src_tjson):
+                    print(f"Warning: transforms.json not found for view {i:05d} at {src_tjson}")
+                    continue
+                with open(src_tjson, 'r') as f:
+                    tdata = json.load(f)
+                # capture some top-level fields from first view if present
+                if not top_level and isinstance(tdata, dict):
+                    for k in ['cx','cy','fl_x','fl_y','h','w','camera_angle_x','camera_angle_y']:
+                        if k in tdata:
+                            top_level[k] = tdata[k]
+                # each multiview export contains one frame
+                if 'frames' in tdata and len(tdata['frames']) > 0:
+                    fr = tdata['frames'][0]
+                    fr['timestep_index'] = i
+                    fr['timestep_index_original'] = i
+                    fr['timestep_id'] = f"{i:05d}"
+                    # Keep camera_index/id if present
+                    combined_frames.append(fr)
+                else:
+                    print(f"Warning: no frames in {src_tjson}")
+            # write combined transforms
+            combined = {'frames': combined_frames}
+            if top_level:
+                combined.update({k: v for k, v in top_level.items()})
+                combined['timestep_indices'] = [i for i in range(len(combined_frames))]
+                combined['camera_indices'] = [0]
+            with open(os.path.join(processed_data_dir, 'transforms.json'), 'w') as f:
+                json.dump(combined, f, indent=2)
+        except Exception as e:
+            print(f"Warning: failed to build combined transforms.json: {e}")
         
-        if not all_flame_params:
-            raise RuntimeError("No images were successfully processed")
-        
-        # Combine all views into a single output directory
-        combined_output_dir = os.path.join(tracking_output_dir, 'combined')
-        os.makedirs(combined_output_dir, exist_ok=True)
-        
-        # Combine FLAME parameters from all views
-        combined_flame_params = {}
-        for key in all_flame_params[0].keys():
-            combined_flame_params[key] = torch.cat([params[key] for params in all_flame_params], dim=1)
-        
-        # Save combined FLAME parameters
-        flame_param_dir = os.path.join(combined_output_dir, 'flame_param')
-        os.makedirs(flame_param_dir, exist_ok=True)
-        
-        # Save canonical shape (use first view's shape)
-        canonical_shape = combined_flame_params['betas'][0, 0]  # [300]
-        np.savez(os.path.join(combined_output_dir, 'canonical_flame_param.npz'), shape=canonical_shape.numpy())
-        
-        # Save per-frame FLAME parameters
-        for i in range(combined_flame_params['betas'].shape[1]):
-            frame_params = {k: v[0, i] for k, v in combined_flame_params.items()}
-            np.savez(os.path.join(flame_param_dir, f'{i:05d}.npz'), **{k: v.numpy() for k, v in frame_params.items()})
-        
-        # Combine camera parameters
-        combined_intrs = torch.cat([intrs for intrs, _ in all_camera_params], dim=1)  # [1, N_views, 4, 4]
-        combined_c2ws = torch.cat([c2ws for _, c2ws in all_camera_params], dim=1)    # [1, N_views, 4, 4]
-        
-        # Create transforms.json for combined views
-        transforms_data = {
-            'camera_angle_x': 0.6911112070083618,
-            'frames': []
-        }
-        
-        for i in range(combined_intrs.shape[1]):
-            intr = combined_intrs[0, i]
-            c2w = combined_c2ws[0, i]
-            
-            # Convert back to OpenGL convention for transforms.json
-            c2w_gl = c2w.clone()
-            c2w_gl[:3, 1:3] *= -1
-            
-            frame_data = {
-                'file_path': f'./images/{i:05d}.png',
-                'fl_x': float(intr[0, 0]),
-                'fl_y': float(intr[1, 1]),
-                'cx': float(intr[0, 2]),
-                'cy': float(intr[1, 2]),
-                'transform_matrix': c2w_gl.tolist()
-            }
-            transforms_data['frames'].append(frame_data)
-        
-        # Save transforms.json
-        with open(os.path.join(combined_output_dir, 'transforms.json'), 'w') as f:
-            json.dump(transforms_data, f, indent=2)
-        
-        # Copy processed data from first view (they should be similar)
-        first_view_export = os.path.join(tracking_output_dir, 'view_000', 'export')
-        if os.path.exists(first_view_export):
-            import shutil
-            shutil.copytree(first_view_export, os.path.join(combined_output_dir, 'export'), dirs_exist_ok=True)
-        
-        print(f"Successfully combined {len(all_flame_params)} views into {combined_output_dir}")
-        return combined_output_dir
+        return tracking_output_dir
 
     def load_input_camera_params(self, tracking_output_dir, N_input):
         """Load camera parameters for input frames from tracking output"""
@@ -575,18 +568,21 @@ class FastAvatarInferrer(Inferrer):
             output_dir = self.process_monocular_input(input_path, inference_N_frames)
 
         print(f"FLAME tracking completed. Output directory: {output_dir}")
-        
-        # Load input FLAME parameters
-        input_flame_params = self.load_input_flame_params(output_dir, inference_N_frames)
+
+        input_flame_params = self.load_input_flame_params(output_dir, inference_N_frames, self.mode)
         print(f"Input FLAME parameters loaded successfully for {inference_N_frames} frames")
 
-        # Load processed data from tracking output (same as training)
-        # processed_data is inside the output directory
-        processed_data_dir = os.path.join(output_dir, 'processed_data')
-        print(f"Looking for processed_data at: {processed_data_dir}")
-        print(f"Directory exists: {os.path.exists(processed_data_dir)}")
-        if os.path.exists(processed_data_dir):
-            print(f"Directory contents: {os.listdir(processed_data_dir)}")
+        # Derive processed_data path relative to output_dir succinctly
+        base = os.path.basename(output_dir)
+        processed_root = (
+            os.path.dirname(output_dir) if base == 'tracking_output'
+            else os.path.dirname(os.path.dirname(output_dir)) if base == 'export'
+            else output_dir
+        )
+        processed_data_dir = os.path.join(processed_root, 'processed_data')
+        assert os.path.isdir(processed_data_dir), f"processed_data not found at {processed_data_dir}"
+        print(f"Using processed_data directory: {processed_data_dir}")
+        print(f"Directory contents: {os.listdir(processed_data_dir)}")
         
         if os.path.exists(processed_data_dir):
             print(f"Loading processed data from: {processed_data_dir}")
@@ -644,7 +640,7 @@ class FastAvatarInferrer(Inferrer):
                     # Collect data
                     rgbs.append(rgb)
                     masks.append(mask)
-                    bg_colors.append(float(bg_color))  # 转换为 float
+                    bg_colors.append(float(bg_color)) 
                     
                 except Exception as e:
                     print(f"Error loading frame {frame_num}:")
@@ -703,8 +699,8 @@ class FastAvatarInferrer(Inferrer):
         input_intrs = torch.stack(input_intrs_list, dim=0)  # [N_input, 4, 4]
         input_intrs = input_intrs.unsqueeze(0)  # [1, N_input, 4, 4]
 
-        # Load camera poses from tracking output
-        _, input_c2ws = self.load_input_camera_params(output_dir, len(frame_dirs))
+        # Load camera poses from processed_data (use transforms.json placed here)
+        _, input_c2ws = self.load_input_camera_params(processed_data_dir, len(frame_dirs))
 
         # input bg_colors: only use processed_data's float values
         input_bg_colors = torch.tensor(np.array(bg_colors), dtype=torch.float32).unsqueeze(-1).repeat(1, 3)  # [N_input, 3]
@@ -717,8 +713,6 @@ class FastAvatarInferrer(Inferrer):
         for k in inf_flame_params:
             inf_flame_params[k] = torch.cat([inf_flame_params[k]], dim=1)  # [1, N_target, ...]
         
-        n_inf = target_c2ws.shape[1]
-
         # Move all tensors to GPU
         device = self.device
         rgbs = rgbs.to(device)
@@ -731,11 +725,12 @@ class FastAvatarInferrer(Inferrer):
         inf_flame_params = {k: v.to(device) for k, v in inf_flame_params.items()}
         input_flame_params = {k: v.to(device) for k, v in input_flame_params.items()}
 
-        # Assert that input FLAME parameters betas frame count matches input frame count
-        input_frame_count = rgbs.shape[1]  # Number of input frames
-        input_betas_frame_count = input_flame_params["betas"].shape[1]  # Number of frames in input betas
-        assert input_frame_count == input_betas_frame_count, \
-            f"Input frame count ({input_frame_count}) does not match input FLAME betas frame count ({input_betas_frame_count})"
+        # Allow betas to be single-frame for multiview, or match input frames for monocular
+        input_frame_count = rgbs.shape[1]
+        input_betas_frame_count = input_flame_params["betas"].shape[1]
+        assert input_betas_frame_count in (1, input_frame_count), (
+            f"Input betas frames must be 1 or equal to input frames; got {input_betas_frame_count} vs {input_frame_count}"
+        )
 
         # Run model inference
         print("\nStarting model inference.........................")
@@ -793,36 +788,16 @@ class FastAvatarInferrer(Inferrer):
             # For video input, use the video name
             uid = os.path.splitext(os.path.basename(self.cfg.image_input))[0]
         elif os.path.isfile(self.cfg.image_input):
-            # For single image input, use the original logic
-            uid = os.path.basename(os.path.dirname(os.path.dirname(image_path)))
+            # For single image input, use the image filename without extension
+            uid = os.path.splitext(os.path.basename(self.cfg.image_input))[0]
         else:
             # For folder input, use the folder name
             uid = os.path.basename(self.cfg.image_input)
         
         dump_video_path = os.path.join(self.cfg.video_dump, f'{uid}.mp4')
-        dump_image_dir = os.path.join(self.cfg.image_dump, f'{uid}')
-        dump_tmp_dir = os.path.join(self.cfg.image_dump, "tmp_res")
         
-        os.makedirs(dump_image_dir, exist_ok=True)
-        os.makedirs(dump_tmp_dir, exist_ok=True)
-
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
         self.save_imgs_2_video(rgb, dump_video_path, self.cfg.render_fps)
         print(f"Video saved to: {dump_video_path}")
-
-        # Add audio if available
-        base_vid = self.cfg.motion_seqs_dir.strip('/').split('/')[-1]
-        audio_path = os.path.join(self.cfg.motion_seqs_dir, base_vid + ".wav")
-        if os.path.exists(audio_path):
-            dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
-            self.add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
-            print(f"Audio added to video: {dump_video_path_wa}")
-
-        # Save individual frames (disabled by default)
-        if False and dump_image_dir is not None:
-            print("\nSaving individual frames...")
-            for i in range(rgb.shape[0]):
-                save_file = os.path.join(dump_image_dir, f"{i:04d}.png")
-                Image.fromarray(only_pred[i]).save(save_file)
 
         print("\nInference and saving completed successfully!")

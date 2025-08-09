@@ -61,8 +61,6 @@ class ModelFastAvatar(nn.Module):
                  use_camera_tokens: bool = True,
                  camera_encoder_config: dict = None,
                  use_multi_frame_pc: bool = True,
-                 use_triplane: bool = False,
-                 triplane_config: dict = None,
                  **kwargs,
                  ):
         super().__init__()
@@ -107,8 +105,6 @@ class ModelFastAvatar(nn.Module):
                                      oral_mesh_flag=kwargs.get("oral_mesh_flag", False),
                                      use_mesh_shading=kwargs.get('use_mesh_shading', False),
                                      render_rgb=kwargs.get("render_rgb", True),
-                                     use_triplane=use_triplane,
-                                     triplane_config=triplane_config,
                                      )
         
         self.patch_start_idx = 0

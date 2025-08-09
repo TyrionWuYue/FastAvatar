@@ -84,10 +84,9 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
             return False
         with open(transforms_path, 'r') as f:
             transforms_data = json.load(f)
+               
         
-        
-        # Create processed_data directory inside the export directory
-        processed_data_dir = os.path.join(frame_dir, 'export', 'processed_data')
+        processed_data_dir = os.path.join(os.path.dirname(frame_dir), 'processed_data')
         os.makedirs(processed_data_dir, exist_ok=True)
         
         # Process each image using the corresponding landmarks
@@ -119,18 +118,13 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
                 rgb = rgb / 255.0
                 
                 # 2. Process mask
-                mask_path = os.path.join(frame_dir, 'export', 'mask', f'{frame_idx:05d}.png')
+                mask_path = os.path.join(frame_dir, 'preprocess', 'mask', f'{frame_idx:05d}.png')
                 if os.path.exists(mask_path):
-                    mask = np.array(Image.open(mask_path)) > 180
+                    mask = np.array(Image.open(mask_path))
                     if len(mask.shape) == 3:
                         mask = mask[..., 0]
                 else:
-                    mask = (rgb >= 0.99).sum(axis=2) == 3
-                    mask = np.logical_not(mask)
-                    mask = (mask * 255).astype(np.uint8)
-                    kernel_size, iterations = 3, 7
-                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-                    mask = cv2.erode(mask, kernel, iterations=iterations) / 255.0
+                    raise FileNotFoundError(f'Mask file not found: {mask_path}')
                 
                 if len(mask.shape) > 2:
                     mask = mask[:, :, 0]
@@ -138,10 +132,8 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
                 
                 # 3. Apply background color (fixed white for inference)
                 bg_color = 1.0  # Fixed white background
-                rgb = rgb[:, :, :3] * mask[:, :, None] + bg_color * (1 - mask[:, :, None])
                 
                 # 4. Resize to render_tgt_size for training (no cropping to preserve intrinsics)
-                # For 1024x1024 input, we need to resize to the target size
                 current_h, current_w = rgb.shape[:2]
                 logger.info(f'Current image size: {current_h}x{current_w}, target size: {render_tgt_size}')
                 
@@ -155,13 +147,11 @@ def process_data_augmentation(frame_dir, aspect_standard=1.0, render_tgt_size=51
                 new_w = (new_w // multiply) * multiply
                 
                 rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
-                mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (H, W) -> (1, H, W)
                 
                 rgb_resized = torchvision.transforms.functional.resize(rgb_tensor, (new_h, new_w), antialias=True)
-                mask_resized = torchvision.transforms.functional.resize(mask_tensor, (new_h, new_w), antialias=True)
+                mask = cv2.resize(mask, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)
                 
                 rgb = rgb_resized.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
-                mask = mask_resized.squeeze(0).numpy()  # (1, H, W) -> (H, W)
 
                 # Update ratios for intrinsic matrix
                 ratio_y = new_h / current_h

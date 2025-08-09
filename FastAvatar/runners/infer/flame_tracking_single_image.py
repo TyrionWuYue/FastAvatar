@@ -32,7 +32,7 @@ def calc_new_tgt_size_by_aspect(cur_hw, aspect_standard, tgt_size, multiply):
     """Calculate new target size that is divisible by multiply.
     
     Args:
-        cur_hw: Current height and width tuple (h, w)
+        cur_hw: Current height and width tuple (h, w) Images directory not found
         aspect_standard: Target aspect ratio (h/w)
         tgt_size: Target size
         multiply: Number that the final size should be divisible by
@@ -53,148 +53,106 @@ def process_data_augmentation_single_image(frame_dir, aspect_standard=1.0, rende
         # Debug: Log the actual frame_dir value
         logger.info(f'process_data_augmentation_single_image called with frame_dir: {frame_dir}')
         
-        # Load the processed images from export directory
-        images_dir = os.path.join(frame_dir, 'export', 'images')
-        if not os.path.exists(images_dir):
-            logger.warning(f'Images directory not found: {images_dir}')
-            return False
+        # 1) derive frame_idx
+        view_name = os.path.basename(frame_dir)
+        assert view_name.isdigit(), f"Bad view dir: {view_name} (expect '#####')"
+        frame_idx_5d = f"{int(view_name):05d}"
         
-        # Get all image files
+        export_base = os.path.join(frame_dir, 'export')
+        preprocess_base = os.path.join(frame_dir, 'preprocess')
+        assert os.path.isdir(export_base), f"Missing export: {export_base}"
+        assert os.path.isdir(preprocess_base), f"Missing preprocess: {preprocess_base}"
+        
+        # 2) strict images dir
+        images_dir = os.path.join(export_base, frame_idx_5d, 'images')
+        assert os.path.isdir(images_dir), f"Images directory not found: {images_dir}"
         image_files = sorted(glob.glob(os.path.join(images_dir, '*.png')))
-        if not image_files:
-            logger.warning(f'No image files found in {images_dir}')
-            return False
+        assert image_files, f"No image files in {images_dir}"
         
-        # Landmark2d data is stored in the preprocess directory
-        landmark_dir = os.path.join(frame_dir, 'preprocess', 'landmark2d')
-        if not os.path.exists(landmark_dir):
-            logger.warning(f'Landmark2d directory not found: {landmark_dir}')
-            return False
-        
-        # For single image processing, we use the landmarks.npz file
-        landmark_path = os.path.join(landmark_dir, 'landmarks.npz')
-        if not os.path.exists(landmark_path):
-            logger.warning(f'Landmarks file not found: {landmark_path}')
-            return False
-        
-        transforms_path = os.path.join(frame_dir, 'export', 'transforms.json')
-        if not os.path.exists(transforms_path):
-            logger.warning(f'Transforms.json not found: {transforms_path}')
-            return False
+        # 3) strict transforms
+        transforms_path = os.path.join(export_base, frame_idx_5d, 'transforms.json')
+        assert os.path.isfile(transforms_path), f"Missing transforms.json: {transforms_path}"
         with open(transforms_path, 'r') as f:
             transforms_data = json.load(f)
         
+        # 4) strict preprocess subdir (must be only one)
+        subs = [d for d in os.listdir(preprocess_base) if os.path.isdir(os.path.join(preprocess_base, d))]
+        assert len(subs) == 1, f"Expect exactly one subdir in {preprocess_base}, got {subs}"
+        preprocess_sub = os.path.join(preprocess_base, subs[0])
         
-        # Create processed_data directory inside the export directory
-        processed_data_dir = os.path.join(frame_dir, 'export', 'processed_data')
+        # 5) strict mask path
+        mask_path = os.path.join(preprocess_sub, 'mask', '00000.png')
+        assert os.path.isfile(mask_path), f"Mask missing: {mask_path}"
+        
+        # 6) outputs at the global infer_results/processed_data (sibling of tracking_output)
+        processed_data_dir = os.path.join(os.path.dirname(os.path.dirname(frame_dir)), 'processed_data')
         os.makedirs(processed_data_dir, exist_ok=True)
         
-        # Process each image using the corresponding landmarks
-        for frame_idx, img_path in enumerate(image_files):
-            try:
-                logger.info(f'Processing frame {frame_idx + 1}/{len(image_files)}')
-                
-                # Create frame-specific directory
-                frame_dir_name = f'{frame_idx:05d}'
-                frame_save_dir = os.path.join(processed_data_dir, frame_dir_name)
-                os.makedirs(frame_save_dir, exist_ok=True)
-                
-                # Get frame data from transforms
-                if frame_idx < len(transforms_data['frames']):
-                    frame_data = transforms_data['frames'][frame_idx]
-                else:
-                    # Use first frame data if not enough frames in transforms
-                    frame_data = transforms_data['frames'][0]
-                
-                intr = torch.eye(4)
-                intr[0, 0] = frame_data["fl_x"]
-                intr[1, 1] = frame_data["fl_y"]
-                intr[0, 2] = frame_data["cx"]
-                intr[1, 2] = frame_data["cy"]
-                intr = intr.float()
-                
-                # 1. Load image
-                rgb = np.array(Image.open(img_path))
-                rgb = rgb / 255.0
-                
-                # 2. Process mask
-                mask_path = os.path.join(frame_dir, 'export', 'mask', f'{frame_idx:05d}.png')
-                if os.path.exists(mask_path):
-                    mask = np.array(Image.open(mask_path)) > 180
-                    if len(mask.shape) == 3:
-                        mask = mask[..., 0]
-                else:
-                    mask = (rgb >= 0.99).sum(axis=2) == 3
-                    mask = np.logical_not(mask)
-                    mask = (mask * 255).astype(np.uint8)
-                    kernel_size, iterations = 3, 7
-                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-                    mask = cv2.erode(mask, kernel, iterations=iterations) / 255.0
-                
-                if len(mask.shape) > 2:
-                    mask = mask[:, :, 0]
-                mask = (mask > 0.5).astype(np.float32)
-                
-                # 3. Apply background color (fixed white for inference)
-                bg_color = 1.0  # Fixed white background
-                rgb = rgb[:, :, :3] * mask[:, :, None] + bg_color * (1 - mask[:, :, None])
-                
-                # 4. Resize to render_tgt_size for training (no cropping to preserve intrinsics)
-                # For 1024x1024 input, we need to resize to the target size
-                current_h, current_w = rgb.shape[:2]
-                logger.info(f'Current image size: {current_h}x{current_w}, target size: {render_tgt_size}')
-                
-                # Calculate resize ratio
-                ratio = render_tgt_size / max(current_h, current_w)
-                new_h = int(current_h * ratio)
-                new_w = int(current_w * ratio)
-                
-                # Ensure the new size is divisible by multiply
-                new_h = (new_h // multiply) * multiply
-                new_w = (new_w // multiply) * multiply
-                
-                rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
-                mask_tensor = torch.from_numpy(mask).unsqueeze(0)  # (H, W) -> (1, H, W)
-                
-                rgb_resized = torchvision.transforms.functional.resize(rgb_tensor, (new_h, new_w), antialias=True)
-                mask_resized = torchvision.transforms.functional.resize(mask_tensor, (new_h, new_w), antialias=True)
-                
-                rgb = rgb_resized.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
-                mask = mask_resized.squeeze(0).numpy()  # (1, H, W) -> (H, W)
+        # Single-image case: only process the first frame
+        try:
+            frame_idx = 0
+            img_path = image_files[0]
+            logger.info('Processing single frame (00000) for single-image pipeline')
+            frame_dir_name = f'{frame_idx:05d}'
+            frame_save_dir = os.path.join(processed_data_dir, frame_dir_name)
+            os.makedirs(frame_save_dir, exist_ok=True)
 
-                # Update ratios for intrinsic matrix
-                ratio_y = new_h / current_h
-                ratio_x = new_w / current_w
-                
-                # Update intrinsic matrix
-                intr[0, 0] *= ratio_x
-                intr[1, 1] *= ratio_y
-                intr[0, 2] *= ratio_x
-                intr[1, 2] *= ratio_y
-                
-                # Ensure RGB values are in [0, 1] range after resize
-                rgb = np.clip(rgb, 0.0, 1.0)
-                mask = np.clip(mask, 0.0, 1.0)
-                
-                # Convert to torch tensors
-                rgb = torch.from_numpy(rgb).float().permute(2, 0, 1)  # [3, H, W]
-                mask = torch.from_numpy(mask).float().unsqueeze(0)    # [1, H, W]
-                
-                # Save processed data
-                np.save(os.path.join(frame_save_dir, 'rgb.npy'), rgb.numpy())
-                np.save(os.path.join(frame_save_dir, 'mask.npy'), mask.numpy())
-                np.save(os.path.join(frame_save_dir, 'intrs.npy'), intr.numpy())
-                np.save(os.path.join(frame_save_dir, 'bg_color.npy'), np.array(bg_color))
-                
-                logger.info(f'Frame {frame_idx} processed and saved to {frame_save_dir}')
-                
-            except Exception as e:
-                logger.error(f'Error processing frame {frame_idx}: {e}')
-                continue
-        
-        logger.info(f'Data augmentation completed for {len(image_files)} frames')
-        return True
-        
+            frame_data = transforms_data['frames'][0]
+
+            intr = torch.eye(4)
+            intr[0, 0] = frame_data["fl_x"]
+            intr[1, 1] = frame_data["fl_y"]
+            intr[0, 2] = frame_data["cx"]
+            intr[1, 2] = frame_data["cy"]
+            intr = intr.float()
+
+            rgb = np.array(Image.open(img_path)) / 255.0
+            mask = np.array(Image.open(mask_path))
+            if len(mask.shape) == 3:
+                mask = mask[..., 0]
+            mask = (mask > 0.5).astype(np.float32)
+
+            # background composition
+            bg_color = 1.0
+            rgb = rgb[:, :, :3] * mask[:, :, None] + bg_color * (1 - mask[:, :, None])
+
+            # resize
+            cur_h, cur_w = rgb.shape[:2]
+            ratio = render_tgt_size / max(cur_h, cur_w)
+            new_h = (int(cur_h * ratio) // multiply) * multiply
+            new_w = (int(cur_w * ratio) // multiply) * multiply
+
+            rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1)
+
+            rgb_resized = torchvision.transforms.functional.resize(rgb_tensor, (new_h, new_w), antialias=True)
+            mask = cv2.resize(mask, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)
+            rgb = rgb_resized.permute(1, 2, 0).numpy()
+
+            # update intrinsics
+            ratio_y = new_h / cur_h
+            ratio_x = new_w / cur_w
+            intr[0, 0] *= ratio_x
+            intr[1, 1] *= ratio_y
+            intr[0, 2] *= ratio_x
+            intr[1, 2] *= ratio_y
+
+            rgb = np.clip(rgb, 0.0, 1.0)
+            mask = np.clip(mask, 0.0, 1.0)
+
+            rgb = torch.from_numpy(rgb).float().permute(2, 0, 1)
+            mask = torch.from_numpy(mask).float().unsqueeze(0)
+
+            np.save(os.path.join(frame_save_dir, 'rgb.npy'), rgb.numpy())
+            np.save(os.path.join(frame_save_dir, 'mask.npy'), mask.numpy())
+            np.save(os.path.join(frame_save_dir, 'intrs.npy'), intr.numpy())
+            np.save(os.path.join(frame_save_dir, 'bg_color.npy'), np.array(bg_color))
+
+            logger.info(f'Single frame processed and saved to {frame_save_dir}')
+            logger.info('Data augmentation completed for single-image case (1 frame)')
+            return True
+        except Exception as e:
+            logger.error(f'Error processing single frame: {e}')
+            return False
     except Exception as e:
         logger.error(f'Error in process_data_augmentation_single_image: {e}')
         return False

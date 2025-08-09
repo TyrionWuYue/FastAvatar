@@ -29,7 +29,6 @@ from pytorch3d.transforms import matrix_to_quaternion
 from FastAvatar.models.rendering.utils.typing import *
 from FastAvatar.models.rendering.utils.utils import trunc_exp, MLP
 from FastAvatar.models.rendering.gaussian_model import GaussianModel
-from FastAvatar.models.rendering.utils.triplane_utils import TriPlaneNetwork
 from einops import rearrange, repeat
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
@@ -303,8 +302,6 @@ class GS3DRenderer(nn.Module):
                  add_teeth=True,
                  teeth_bs_flag=False,
                  oral_mesh_flag=False,
-                 use_triplane=False,
-                 triplane_config=None,
                  **kwargs,
                  ):
         super().__init__()
@@ -318,10 +315,6 @@ class GS3DRenderer(nn.Module):
         self.oral_mesh_flag = oral_mesh_flag
         self.render_rgb = kwargs.get("render_rgb", True)
         print("==="*16*3, "\n Render rgb:", self.render_rgb, "\n"+"==="*16*3)
-        
-        # Store TriPlane configuration
-        self.use_triplane = use_triplane
-        self.triplane_config = triplane_config
         
         self.scaling_modifier = 1.0
         self.sh_degree = sh_degree
@@ -350,16 +343,6 @@ class GS3DRenderer(nn.Module):
 
         init_scaling = -5.0
         
-        # Prepare TriPlaneNetwork config
-        if triplane_config is None:
-            triplane_config = {
-                'grid_dim': 2,
-                'in_dim': 3,
-                'out_dim': 32,
-                'resolution': [64, 64, 64],
-                'a': 0.1,
-                'b': 0.5
-            }
         
         num_points = self.flame_model.vertex_num_upsampled
         self.gs_net = GSLayer(in_channels=query_dim,
@@ -376,25 +359,6 @@ class GS3DRenderer(nn.Module):
                               fix_rotation=fix_rotation,
                               use_fine_feat=True if decode_with_extra_info is not None and decode_with_extra_info["type"] is not None else False,
                               )
-        
-        # Initialize TriPlaneNetwork in GS3DRenderer if enabled
-        if self.use_triplane:
-            config = self.triplane_config
-            actual_num_points = num_points if num_points is not None else 20426
-            self.triplane_net = TriPlaneNetwork(
-                sh_degree=sh_degree if sh_degree is not None else 0,
-                num_points=actual_num_points,
-                grid_dim=config.get('grid_dim', 2),
-                in_dim=config.get('in_dim', 3),
-                out_dim=config.get('out_dim', 32),
-                resolution=config.get('resolution', [64, 64, 64]),
-                a=config.get('a', 0.1),
-                b=config.get('b', 0.5)
-            )
-            print(f"Initialized TriPlaneNetwork with {actual_num_points} points")
-
-        else:
-            self.triplane_net = None
         
     def forward_single_view(self,
         gs: GaussianModel,
@@ -445,38 +409,14 @@ class GS3DRenderer(nn.Module):
         scales = gs.scaling
         rotations = gs.rotation
 
-        # Use TriPlaneNetwork for enhanced opacity and shs if enabled (like Gaussian Head)
-        if self.use_triplane and self.triplane_net is not None:
-            # Calculate view directions from 3D points to camera center (like Gaussian Head)
-            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
-            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-            
-            # Use TriPlaneNetwork to generate enhanced opacity and shs (like Gaussian Head)
-            triplane_opacity, triplane_features_dc, triplane_features_rest = self.triplane_net(
-                xyz=means3D,
-                dirs=dir_pp_normalized,
-            )
-            
-            opacity = torch.clamp(gs.opacity + triplane_opacity, 0.0, 1.0)
-            
-            # Follow the same logic as original model for shs and colors_precomp
-            shs = None
-            colors_precomp = None
-            if self.gs_net.use_rgb:
-                triplane_rgb = triplane_features_dc  # [N, 3] - RGB values from TriPlane
-                original_rgb = gs.shs.squeeze(1)  # [N, 3] - Original RGB values
-                colors_precomp = torch.clamp(original_rgb + triplane_rgb, 0.0, 1.0)
-            else:
-                shs = gs.shs
+        # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+        # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+        shs = None
+        colors_precomp = None
+        if self.gs_net.use_rgb:
+            colors_precomp = gs.shs.squeeze(1)
         else:
-            # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-            # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-            shs = None
-            colors_precomp = None
-            if self.gs_net.use_rgb:
-                colors_precomp = gs.shs.squeeze(1)
-            else:
-                shs = gs.shs
+            shs = gs.shs
 
         # Rasterize visible Gaussians to image, obtain their radii (on screen). 
         with torch.autocast(device_type=self.device.type, dtype=torch.float32):

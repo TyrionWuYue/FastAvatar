@@ -12,7 +12,6 @@ model:
     encoder_freeze: true
 
     # points embeddings
-    num_pcl: 2048
     pcl_dim: 1024
 
     # transformer
@@ -67,15 +66,6 @@ model:
     gs_clip_scaling: 0.01
     scale_sphere: false
     
-    # TriPlane config
-    use_triplane: false
-    triplane_config:
-        grid_dim: 2
-        in_dim: 3
-        out_dim: 32
-        resolution: [64, 64, 64]
-        a: 0.1
-        b: 0.5
     
     expr_param_dim: 10
     shape_param_dim: 10
