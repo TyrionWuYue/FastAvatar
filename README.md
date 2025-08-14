@@ -1,5 +1,9 @@
 # FastAvatar: Towards Unified Fast High-Fidelity 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers
 
+<p align="center">
+    <img src="./assets/images/teaser.png" width="100%">
+</p>
+
 ## 🚀 Get Started
 
 ### Enviroment Setup

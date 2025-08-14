@@ -1,3 +1,4 @@
 model_zoo/
 .DS_Store
-assets/
+assets/sample_input/
+assets/sample_motion/
