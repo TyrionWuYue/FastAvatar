@@ -437,9 +437,10 @@ class FastAvatarInferrer(Inferrer):
         processed_data_dir = os.path.join(base, 'processed_data')
         os.makedirs(processed_data_dir, exist_ok=True)
 
+        # Copy processed data files from each frame's tracking output to the global processed_data directory
         for i in range(len(image_files)):
             curr_frame_dir = os.path.join(processed_data_dir, f'{i:05d}')
-            curr_frame_data_dir = os.path.join(tracking_output_dir, f'{i:05d}', 'processed_data', '00000')
+            curr_frame_data_dir = os.path.join(tracking_output_dir, f'{i:05d}', 'processed_data', f'{i:05d}')
             os.makedirs(curr_frame_dir, exist_ok=True)
 
             for fname in ['rgb.npy', 'mask.npy', 'intrs.npy', 'bg_color.npy']:
@@ -785,14 +786,12 @@ class FastAvatarInferrer(Inferrer):
         # Save results
         print("\nSaving results...")
         if os.path.isfile(self.cfg.image_input) and self.cfg.image_input.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-            # For video input, use the video name
             uid = os.path.splitext(os.path.basename(self.cfg.image_input))[0]
         elif os.path.isfile(self.cfg.image_input):
-            # For single image input, use the image filename without extension
             uid = os.path.splitext(os.path.basename(self.cfg.image_input))[0]
         else:
-            # For folder input, use the folder name
-            uid = os.path.basename(self.cfg.image_input)
+            folder_name = os.path.basename(self.cfg.image_input)
+            uid = folder_name if folder_name and folder_name != '.' else 'output'
         
         dump_video_path = os.path.join(self.cfg.video_dump, f'{uid}.mp4')
         

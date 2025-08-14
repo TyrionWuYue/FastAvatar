@@ -84,15 +84,15 @@ def process_data_augmentation_single_image(frame_dir, aspect_standard=1.0, rende
         mask_path = os.path.join(preprocess_sub, 'mask', '00000.png')
         assert os.path.isfile(mask_path), f"Mask missing: {mask_path}"
         
-        # 6) outputs at the global infer_results/processed_data (sibling of tracking_output)
-        processed_data_dir = os.path.join(os.path.dirname(os.path.dirname(frame_dir)), 'processed_data')
+        # 6) outputs at the local processed_data directory (within the frame directory)
+        processed_data_dir = os.path.join(frame_dir, 'processed_data')
         os.makedirs(processed_data_dir, exist_ok=True)
         
-        # Single-image case: only process the first frame
+        # Process the frame based on the actual frame index
         try:
-            frame_idx = 0
+            frame_idx = int(view_name)
             img_path = image_files[0]
-            logger.info('Processing single frame (00000) for single-image pipeline')
+            logger.info(f'Processing frame ({frame_idx:05d}) for single-image pipeline')
             frame_dir_name = f'{frame_idx:05d}'
             frame_save_dir = os.path.join(processed_data_dir, frame_dir_name)
             os.makedirs(frame_save_dir, exist_ok=True)
