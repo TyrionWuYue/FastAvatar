@@ -14,6 +14,10 @@ FastAvatar is a **feedforward** 3D avatar framework capable of flexibly leveragi
 ```bash
 git clone https://github.com/TyrionWuYue/FastAvatar.git
 cd FastAvatar
+
+conda create --name fastavatar python=3.10
+conda activate fastavatar
+
 bash ./scripts/install/install_cu124.sh
 ```
 
