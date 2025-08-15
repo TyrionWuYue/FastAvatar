@@ -661,14 +661,8 @@ class FastAvatarInferrer(Inferrer):
             save_root=self.cfg.save_tmp_dump,
             fps=self.cfg.motion_video_read_fps,
             bg_color=1.0,
-            aspect_standard=1.0,
-            enlarge_ratio=[1.0, 1.0],
-            render_image_res=self.cfg.render_size,
-            need_mask=self.cfg.get("motion_img_need_mask", False),
-            multiply=16,
             vis_motion=self.cfg.get("vis_motion", False),
-            test_sample=self.cfg.get("test_sample", False),
-            cross_id=self.cfg.get("cross_id", False)
+            test_sample=self.cfg.get("test_sample", False)
         )
         print("Motion sequences prepared successfully")
 

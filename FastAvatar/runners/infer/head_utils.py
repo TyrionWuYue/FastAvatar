@@ -328,9 +328,7 @@ def load_flame_params(flame_file_path, teeth_bs=None):
 
 
 def prepare_motion_seqs(motion_seqs_dir, image_folder, save_root, fps,
-                        bg_color, aspect_standard, enlarge_ratio,
-                        render_image_res, need_mask, multiply=16, 
-                        vis_motion=False, shape_param=None, test_sample=False, cross_id=False, src_driven=["", ""]):
+                        bg_color, vis_motion=False, shape_param=None, test_sample=False):
     if motion_seqs_dir is None:
         assert image_folder is not None
         motion_seqs_dir, image_folder = predict_motion_seqs_from_images(image_folder, save_root, fps)
@@ -397,7 +395,6 @@ def prepare_motion_seqs(motion_seqs_dir, image_folder, save_root, fps,
     for k, v in flame_params_tmp.items():
         flame_params_tmp[k] = torch.stack(v)
     flame_params = flame_params_tmp
-    # TODO check different betas for same person
     flame_params["betas"] = shape_param
 
     if vis_motion:
@@ -408,7 +405,6 @@ def prepare_motion_seqs(motion_seqs_dir, image_folder, save_root, fps,
     # add batch dim
     for k, v in flame_params.items():
         flame_params[k] = v.unsqueeze(0)
-        # print(k, flame_params[k].shape, "motion_seq")
     c2ws = c2ws.unsqueeze(0)
     intrs = intrs.unsqueeze(0)
     bg_colors = bg_colors.unsqueeze(0)
@@ -418,7 +414,6 @@ def prepare_motion_seqs(motion_seqs_dir, image_folder, save_root, fps,
     motion_seqs["intrs"] = intrs
     motion_seqs["bg_colors"] = bg_colors
     motion_seqs["flame_params"] = flame_params
-    # motion_seqs["rgbs"] = rgbs
     motion_seqs["vis_motion_render"] = motion_render
     return motion_seqs
 
