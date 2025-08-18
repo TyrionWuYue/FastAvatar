@@ -557,66 +557,32 @@ class ModelFastAvatar(nn.Module):
     
     @torch.no_grad()
     def infer_images(self, image, input_c2ws, input_intrs, target_c2ws, target_intrs, target_bg_colors, input_flame_params, inf_flame_params, render_h=512, render_w=512):
-        import time
-        
         B, N_input = image.shape[:2]
         N_target = target_c2ws.shape[1]
         
         print(f"[INFER] Processing {N_input} input frames, {N_target} target views")
         print(f"[INFER] Render resolution: {render_h}x{render_w}")
         
+        modeling_time = time.time()
         # Step 1: Get query points
         query_points, _ = self.renderer.get_query_points(input_flame_params, device=image.device)
         
         # Step 2: Forward latent points (most expensive step)
-        latent_points_start = time.time()
         # Construct camera parameters dictionary for INPUT frames (for encoder)
         camera_params = {
             'c2w': input_c2ws,
             'intrinsic': input_intrs
         }
         latent_points, _ = self.forward_latent_points(image, query_points=query_points, flame_params=input_flame_params, camera_params=camera_params)
-        latent_points_time = time.time() - latent_points_start
-        print(f"[INFER] forward_latent_points: {latent_points_time:.3f}s")
         
+        modeling_time = time.time() - modeling_time
+
         query_points = query_points.reshape(B, -1, query_points.shape[-1])
         latent_points = latent_points.reshape(B, -1, latent_points.shape[-1])
 
-        render_start = time.time()
-        
-        params_start = time.time()
-        
-        # Debug: Print original flame params shapes
-        print(f"[INFER] Debug - Original inf_flame_params shapes:")
-        for k, v in inf_flame_params.items():
-            if isinstance(v, torch.Tensor):
-                print(f"  {k}: {v.shape}")
-            else:
-                print(f"  {k}: {type(v)}")
-        
-        print(f"[INFER] Debug - Original input_flame_params shapes:")
-        for k, v in input_flame_params.items():
-            if isinstance(v, torch.Tensor):
-                print(f"  {k}: {v.shape}")
-            else:
-                print(f"  {k}: {type(v)}")
-        
         # Use inf_flame_params directly without modification (like in inference code)
         batch_flame_params = inf_flame_params.copy()
-        print(f"[INFER] Using inf_flame_params directly")
         
-        # Debug: Print final batch_flame_params shapes
-        print(f"[INFER] Debug - Final batch_flame_params shapes:")
-        for k, v in batch_flame_params.items():
-            if isinstance(v, torch.Tensor):
-                print(f"  {k}: {v.shape}")
-            else:
-                print(f"  {k}: {type(v)}")
-        
-        params_time = time.time() - params_start
-        print(f"[INFER] flame_params_processing: {params_time:.3f}s")
-
-        convert_start = time.time()
         latent_points = latent_points.float()
         query_points = query_points.float()
         batch_c2ws = target_c2ws.float() 
@@ -624,8 +590,6 @@ class ModelFastAvatar(nn.Module):
         batch_bg_colors = target_bg_colors.float()
         batch_flame_params = {k: v.float() if isinstance(v, torch.Tensor) else v 
                             for k, v in batch_flame_params.items()}
-        convert_time = time.time() - convert_start
-        print(f"[INFER] data_conversion: {convert_time:.3f}s")
         
         # Handle multi-frame point cloud concatenation
         if self.use_multi_frame_pc and N_input > 1:
@@ -635,31 +599,20 @@ class ModelFastAvatar(nn.Module):
                 B_all, N_frames, N_points, C = latent_points.shape
                 latent_points = latent_points.reshape(B_all, N_frames * N_points, C)
                 query_points = query_points.reshape(B_all, N_frames * N_points, 3)
-                print(f"[INFER] Multi-frame PC mode: concatenated {N_frames} frames, total points: {N_frames * N_points}")
-            else:
-                # Already reshaped, just print info
-                print(f"[INFER] Multi-frame PC mode: already concatenated, shape: {latent_points.shape}")
         else:
             # Single-frame mode: use only the first frame
             if N_input > 1:
                 if len(latent_points.shape) == 4:
                     latent_points = latent_points[:, 0]  # [B, N_points, C]
                     query_points = query_points[:, 0]    # [B, N_points, 3]
-                print(f"[INFER] Single-frame PC mode: using first frame only")
-            else:
-                print(f"[INFER] Single input frame mode")
 
-        gs_start = time.time()
+        render_start = time.time()
 
         gs_model_list, curr_query_points, curr_flame_params, _ = self.renderer.forward_gs(
             gs_hidden_features=latent_points, 
             query_points=query_points, 
             flame_data=input_flame_params
         )
-        gs_time = time.time() - gs_start
-        print(f"[INFER] forward_gs: {gs_time:.3f}s")
-
-        animate_start = time.time()
         
         render_res = self.renderer.forward_animate_gs(
             gs_model_list, 
@@ -672,11 +625,8 @@ class ModelFastAvatar(nn.Module):
             batch_bg_colors,
             num_input_frames=N_input
         )
-        animate_time = time.time() - animate_start
-        print(f"[INFER] forward_animate_gs: {animate_time:.3f}s")
         
         total_render_time = time.time() - render_start
-        print(f"[INFER] Total rendering time: {total_render_time:.3f}s")
         
         # Store timing information in output
         out = render_res
@@ -695,5 +645,8 @@ class ModelFastAvatar(nn.Module):
                 out["comp_depth"] = out["comp_depth"][0].permute(0, 2, 3, 1)
         
         out['cano_gs_lst'] = gs_model_list
+
+        out['modeling_time'] = modeling_time
+        out['render_time'] = total_render_time
         
         return out

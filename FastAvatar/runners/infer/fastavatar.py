@@ -406,10 +406,7 @@ class FastAvatarInferrer(Inferrer):
             image_files = image_files[:inference_N_frames]
             print(f"Limited to {inference_N_frames} frames (out of {len(image_files)} total)")
         
-        print(f"Processing {len(image_files)} images in MultiView mode")
-        
         for i, image_file in enumerate(image_files):
-            print(f"Processing image {i+1}/{len(image_files)}: {os.path.basename(image_file)}")
             
             # Update output directory for this view (numeric, 5 digits to match monocular)
             view_output_dir = os.path.join(tracking_output_dir, f'{i:05d}')
@@ -530,7 +527,6 @@ class FastAvatarInferrer(Inferrer):
         input_intrs = torch.stack(input_intrs_list).unsqueeze(0)  # [1, N_input, 4, 4]
         input_c2ws = torch.stack(input_c2ws_list).unsqueeze(0)    # [1, N_input, 4, 4]
         
-        print(f"Successfully loaded camera parameters for {len(frames)} input frames")
         return input_intrs, input_c2ws
 
     def infer(self):
@@ -571,7 +567,6 @@ class FastAvatarInferrer(Inferrer):
         print(f"FLAME tracking completed. Output directory: {output_dir}")
 
         input_flame_params = self.load_input_flame_params(output_dir, inference_N_frames, self.mode)
-        print(f"Input FLAME parameters loaded successfully for {inference_N_frames} frames")
 
         # Derive processed_data path relative to output_dir succinctly
         base = os.path.basename(output_dir)
@@ -582,12 +577,8 @@ class FastAvatarInferrer(Inferrer):
         )
         processed_data_dir = os.path.join(processed_root, 'processed_data')
         assert os.path.isdir(processed_data_dir), f"processed_data not found at {processed_data_dir}"
-        print(f"Using processed_data directory: {processed_data_dir}")
-        print(f"Directory contents: {os.listdir(processed_data_dir)}")
         
         if os.path.exists(processed_data_dir):
-            print(f"Loading processed data from: {processed_data_dir}")
-            
             # Get all frame directories
             frame_dirs = []
             for item in os.listdir(processed_data_dir):
@@ -603,12 +594,8 @@ class FastAvatarInferrer(Inferrer):
                 return
             
             # Limit to inference_N_frames if specified
-            original_count = len(frame_dirs)
             if inference_N_frames is not None and len(frame_dirs) > inference_N_frames:
                 frame_dirs = frame_dirs[:inference_N_frames]
-                print(f"Limited to {inference_N_frames} frames (out of {original_count} total)")
-            else:
-                print(f"Found {len(frame_dirs)} frames")
             
             for frame_num, frame_dir in frame_dirs:
                 try:
@@ -636,8 +623,6 @@ class FastAvatarInferrer(Inferrer):
                     if len(mask.shape) == 3:
                         mask = mask.unsqueeze(0)  # [1, 1, H, W]
                     
-                    print(f"Frame {frame_num} loaded - RGB shape: {rgb.shape}, Mask shape: {mask.shape}")
-
                     # Collect data
                     rgbs.append(rgb)
                     masks.append(mask)
@@ -679,7 +664,6 @@ class FastAvatarInferrer(Inferrer):
         if not rgbs:
             raise RuntimeError(f"No frames were successfully loaded. rgbs list is empty. processed_data_dir: {processed_data_dir}")
         
-        print(f"Successfully loaded {len(rgbs)} frames")
         rgbs = torch.cat(rgbs, dim=0)  # [N_input, 3, H, W]
         rgbs = rgbs.unsqueeze(0)  # [1, N_input, 3, H, W]
         masks = torch.cat(masks, dim=0)  # [N_input, 1, H, W]
@@ -729,10 +713,8 @@ class FastAvatarInferrer(Inferrer):
 
         # Run model inference
         print("\nStarting model inference.........................")
-        start_time = time.time()
 
         with torch.no_grad():
-            frame_results = []
             
             # Get max_single_frame_render from config, default to 8
             max_single_frame_render = self.cfg.get("max_single_frame_render", 8)
@@ -742,7 +724,7 @@ class FastAvatarInferrer(Inferrer):
             print(f"Max single frame render: {max_single_frame_render}")
                 
             # Multi-frame inference
-            multi_frame_start_time = time.time()
+
             res = self.model.infer_images(
                 rgbs,
                 input_c2ws,
@@ -753,32 +735,20 @@ class FastAvatarInferrer(Inferrer):
                 input_flame_params=input_flame_params,
                 inf_flame_params=inf_flame_params
             )
-            multi_frame_total_time = time.time() - multi_frame_start_time
-            print(f"Multi-frame rendering completed:")
-            print(f"  - Total time: {multi_frame_total_time:.2f} seconds")
+
             
-            frame_results.append(res["comp_rgb"].detach().cpu().numpy())
-                
-            # Combine results horizontally
-            combined_results = []
-            for i in range(len(frame_results[0])):
-                frame_row = []
-                for result in frame_results:
-                    frame_row.append(result[i])
-                combined_frame = np.hstack(frame_row)
-                combined_results.append(combined_frame)
-            rgb = np.array(combined_results)
+            rgb = res["comp_rgb"].detach().cpu().numpy()
         
-        total_inference_time = time.time() - start_time
-        print(f"Total inference completed in {total_inference_time:.2f} seconds")
+        render_time = res['render_time']
+        modeling_time = res['modeling_time']
+        print(f"Render time: {render_time:.2f} seconds")
+        print(f"Modeling time: {modeling_time:.2f} seconds")
+        print(f"Render FPS: {target_c2ws.shape[1] / render_time:.2f}")
 
         # Process results
-        print("\nProcessing inference results...")
         rgb = (np.clip(rgb, 0, 1.0) * 255).astype(np.uint8)
-        only_pred = rgb
 
         # Save results
-        print("\nSaving results...")
         if os.path.isfile(self.cfg.image_input) and self.cfg.image_input.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
             uid = os.path.splitext(os.path.basename(self.cfg.image_input))[0]
         elif os.path.isfile(self.cfg.image_input):
@@ -792,5 +762,3 @@ class FastAvatarInferrer(Inferrer):
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
         self.save_imgs_2_video(rgb, dump_video_path, self.cfg.render_fps)
         print(f"Video saved to: {dump_video_path}")
-
-        print("\nInference and saving completed successfully!")
