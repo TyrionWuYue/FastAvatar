@@ -10,6 +10,9 @@ FastAvatar is a **feedforward** 3D avatar framework capable of flexibly leveragi
 ## 📹 Demo
 
 ### Self-reenacted
+<div align="center">
+    <img src="assets/images/self_001.gif">
+</div>
 
 ### Cross-reenacted
 <div align="center">
