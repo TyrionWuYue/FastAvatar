@@ -26,6 +26,7 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from accelerate.logging import get_logger
 from collections import defaultdict
+import math
 
 from FastAvatar.runners.infer.head_utils import prepare_motion_seqs, preprocess_image, load_flame_params
 from FastAvatar.runners.infer.base_inferrer import Inferrer
@@ -35,6 +36,49 @@ from FastAvatar.runners.infer.flame_tracking_multi_image import FlameTrackingMul
 from FastAvatar.runners.infer.flame_tracking_single_image import FlameTrackingSingleImage
 
 logger = get_logger(__name__)
+
+def generate_camera_rotation(base_c2w, base_intr, num_frames):
+    """
+    Generate camera rotation around the target using PyTorch3D.
+    """
+    from pytorch3d.renderer import look_at_view_transform
+
+    device = base_c2w.device
+    base_cam_pos = base_c2w[:3, 3]
+    target_pos = torch.zeros(3, device=device)
+    dist = torch.norm(base_cam_pos - target_pos)
+
+    # Motion parameters
+    elev_amp = 5.0   # elevation amplitude (degrees)
+    azim_amp = 12.0  # azimuth amplitude (degrees)
+    base_elev = 0.0
+    base_azim = 0.0
+
+    t = torch.linspace(0, 2*torch.pi, num_frames, device=device)
+    elev = -(base_elev + elev_amp * torch.cos(t))
+    azim = -(base_azim + azim_amp * torch.sin(t))
+
+    R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim,
+                                  at=target_pos[None], device=device)
+
+    # More elegant way: apply coordinate correction directly to R
+    R[:, :3, :2] *= -1  # Fix X and Y axes in rotation matrix
+    
+    c2ws = []
+    intrs = []
+    for i in range(num_frames):
+        w2c = torch.eye(4, device=device)
+        w2c[:3, :3] = R[i]
+        w2c[:3, 3] = T[i]
+        c2w = torch.inverse(w2c)
+        c2ws.append(c2w)
+        intrs.append(base_intr)
+
+    c2ws = torch.stack(c2ws, dim=0)
+    intrs = torch.stack(intrs, dim=0)
+
+    return c2ws, intrs
+
 
 def parse_configs():
     
@@ -91,6 +135,9 @@ def parse_configs():
     cfg.setdefault('render_fps', 30)
     cfg.setdefault('motion_video_read_fps', 7.5)
     cfg.setdefault('export_video', True)
+    
+    # Camera rotation parameters
+    cfg.setdefault('enable_camera_rotation', False)  # Enable camera rotation around target
     # assert not (args.config is not None and args.infer is not None), "Only one of config and infer should be provided"
     assert cfg.model_name is not None, "model_name is required"
     if not os.environ.get('APP_ENABLED', None):
@@ -659,6 +706,58 @@ class FastAvatarInferrer(Inferrer):
         # Stack all collected data (maintaining batch dimension)
         target_c2ws = torch.cat(c2ws, dim=1)  # [1, N_target, 4, 4] - for rendering
         target_intrs = motion_seqs["intrs"]  # Already has batch dim [1, N_target, 4, 4] - for rendering
+        
+        # Apply camera rotation if enabled
+        if self.cfg.get('enable_camera_rotation', False):
+            print("Applying camera rotation...")
+            
+            # Get base camera parameters (use the first frame as reference)
+            base_c2w = target_c2ws[0, 0]  # [4, 4]
+            base_intr = target_intrs[0, 0]  # [4, 4]
+            
+            # Calculate total frames for rotation (2 complete loops)
+            original_frames = target_c2ws.shape[1]
+            loops = 1
+            total_rotation_frames = original_frames * loops
+            
+            # Generate rotated camera parameters
+            rotated_c2ws, rotated_intrs = generate_camera_rotation(
+                base_c2w, base_intr, total_rotation_frames
+            )
+            
+            # Add batch dimension
+            rotated_c2ws = rotated_c2ws.unsqueeze(0)  # [1, N_rotated, 4, 4]
+            rotated_intrs = rotated_intrs.unsqueeze(0)  # [1, N_rotated, 4, 4]
+            
+            # Replace target camera parameters with rotated ones
+            target_c2ws = rotated_c2ws
+            target_intrs = rotated_intrs
+            
+            # Extend FLAME parameters to match the new frame count
+            for k in inf_flame_params:
+                if inf_flame_params[k].shape[1] == original_frames:
+                    # Repeat FLAME parameters to match rotation frames
+                    repeated_params = []
+                    for loop in range(loops):
+                        repeated_params.append(inf_flame_params[k])
+                    inf_flame_params[k] = torch.cat(repeated_params, dim=1)
+            
+            # Extend background colors to match the new frame count
+            original_bg_colors = motion_seqs["bg_colors"]  # [1, N_original, 3]
+            repeated_bg_colors = []
+            for loop in range(loops):
+                repeated_bg_colors.append(original_bg_colors)
+            target_bg_colors = torch.cat(repeated_bg_colors, dim=1)  # [1, N_rotated, 3]
+            
+            print(f"Camera rotation applied: {original_frames} frames -> {total_rotation_frames} frames")
+            print(f"Loops: {loops}")
+        else:
+            # Use original target background colors
+            target_bg_colors = motion_seqs["bg_colors"]  # [1, N_target, 3]
+        
+        # Assert that camera parameters have the same shape as background colors
+        assert target_c2ws.shape[1] == target_bg_colors.shape[1], f"Camera frames ({target_c2ws.shape[1]}) must match background color frames ({target_bg_colors.shape[1]})"
+        assert target_intrs.shape[1] == target_bg_colors.shape[1], f"Intrinsic frames ({target_intrs.shape[1]}) must match background color frames ({target_bg_colors.shape[1]})"
         
         # Stack input data from processed_data (following disorder_video_head.py pattern)
         if not rgbs:

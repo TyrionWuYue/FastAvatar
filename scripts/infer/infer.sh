@@ -8,6 +8,7 @@ MOTION_SEQS_DIR="assets/sample_motion/export/Donald_Trump/"
 INFERENCE_N_FRAMES=4
 MAX_SINGLE_FRAME_RENDER=8
 MODE="Monocular"  # Options: "Monocular", "MultiView"
+ENABLE_CAMERA_ROTATION=false  # Set to true to enable camera rotation
 
 # Allow command line overrides
 TRAIN_CONFIG=${1:-$TRAIN_CONFIG}
@@ -17,6 +18,7 @@ MOTION_SEQS_DIR=${4:-$MOTION_SEQS_DIR}
 INFERENCE_N_FRAMES=${5:-$INFERENCE_N_FRAMES}
 MAX_SINGLE_FRAME_RENDER=${6:-$MAX_SINGLE_FRAME_RENDER}
 MODE=${7:-$MODE}
+ENABLE_CAMERA_ROTATION=${8:-$ENABLE_CAMERA_ROTATION}
 
 echo "TRAIN_CONFIG: $TRAIN_CONFIG"
 echo "IMAGE_INPUT: $IMAGE_INPUT"
@@ -25,9 +27,10 @@ echo "MOTION_SEQS_DIR: $MOTION_SEQS_DIR"
 echo "INFERENCE_N_FRAMES: $INFERENCE_N_FRAMES"
 echo "MAX_SINGLE_FRAME_RENDER: $MAX_SINGLE_FRAME_RENDER"
 echo "MODE: $MODE"
+echo "ENABLE_CAMERA_ROTATION: $ENABLE_CAMERA_ROTATION"
 
 # Essential parameters
-RENDER_FPS=30
+RENDER_FPS=20
 MOTION_VIDEO_READ_FPS=7.5
 EXPORT_VIDEO=true
 EXPORT_MESH=true
@@ -50,4 +53,5 @@ CUDA_VISIBLE_DEVICES=$device python -m FastAvatar.launch infer.fastavatar \
     motion_video_read_fps=$MOTION_VIDEO_READ_FPS \
     inference_N_frames=$INFERENCE_N_FRAMES \
     max_single_frame_render=$MAX_SINGLE_FRAME_RENDER \
-    mode=$MODE
+    mode=$MODE \
+    enable_camera_rotation=$ENABLE_CAMERA_ROTATION
