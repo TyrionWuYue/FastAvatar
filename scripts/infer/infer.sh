@@ -3,10 +3,10 @@
 # Core parameters
 TRAIN_CONFIG="configs/inference/infer.yaml"
 MODEL_NAME="model_zoo/fastavatar/"
-IMAGE_INPUT="/inspire/hdd/project/project-public/fengkairui-25026/nersemble_data/sequence_EXP-1-head_part-7/325/EXP-1-head/cam_222200037.mp4"
-MOTION_SEQS_DIR="assets/sample_motion/export/Donald_Trump/"
-INFERENCE_N_FRAMES=4
-MAX_SINGLE_FRAME_RENDER=8
+IMAGE_INPUT="assets/sample_input/mono_video/nersemble_seq_214.mp4"
+MOTION_SEQS_DIR="assets/sample_motion/nersemble_seq_214/"
+INFERENCE_N_FRAMES=16
+MAX_SINGLE_FRAME_RENDER=16
 MODE="Monocular"  # Options: "Monocular", "MultiView"
 ENABLE_CAMERA_ROTATION=false  # Set to true to enable camera rotation
 
