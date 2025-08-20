@@ -43,6 +43,25 @@ conda activate fastavatar
 bash ./scripts/install/install_cu124.sh
 ```
 
+### HuggingFace Download
+```bash
+# Download Assets
+# export HF_ENDPOINT=https://hf-mirror.com
+huggingface-cli download TyrionWuY/FastAvatar-assets --local-dir ./tmp
+tar -xf ./tmp/assets.tar 
+tar -xf ./tmp/model_zoo.tar
+rm -r ./tmp/
+# Download Model Weihts
+huggingface-cli download TyrionWuY/FastAvatar --local-dir ./model_zoo/fastavatar/
+```
+
+### Inference
+```bash
+bash scripts/infer/infer.sh ${CONFIG} ${MODEL_NAME} ${IMAGE_INPUT} ${MOTION_SEQS_DIR} ${INFERENCE_N_FRAMES} ${MODE}
+```
+
+
+
 ### Acknowledgement
 This work is built on many amazing research works and open-source projects:
 - [VGGT](https://github.com/facebookresearch/vggt)
