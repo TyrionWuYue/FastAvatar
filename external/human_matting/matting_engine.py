@@ -21,7 +21,6 @@ def fill_small_holes(mask, radius=16):
     
     for label in range(1, num_labels):
         hole_size = np.sum(labels == label)
-        print(f"Hole {label}: size = {hole_size}")
         
         if hole_size <= radius*radius:
             filled_mask[labels == label] = 255
