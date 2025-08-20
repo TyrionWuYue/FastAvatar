@@ -7,6 +7,11 @@
 ## 🔥 Overview
 FastAvatar is a **feedforward** 3D avatar framework capable of flexibly leveraging diverse daily recordings (e.g., a single image, multi-view observations, or monocular video) to reconstruct a high-quality 3D Gaussian Splatting (3DGS) model **within seconds**, using only a single **unified** model.
 
+## 🎉 Core Highlights 
+- **Unified Model with Flexible Multi-frame Aggregation for Ultra-high-fidelity Avatars**
+- **Fast Feedforward Framework Delivering High-quality 3D Gaussian Splatting Models in Seconds**
+- **Incremental 3D Avatar Reconstruction Leveraging Diverse Inputs (single-shot, monocular and multi-view)**
+
 ## 📹 Demo
 
 ### Self-reenacted
@@ -19,7 +24,10 @@ FastAvatar is a **feedforward** 3D avatar framework capable of flexibly leveragi
     <img src="assets/images/cross_001.gif">
 </div>
 
-### Multi-view
+### Multi-view & Incremental Reconstruction
+<div align="center">
+    <img src="assets/images/multiview_001.gif">
+</div>
 
 ## 🚀 Get Started
 
