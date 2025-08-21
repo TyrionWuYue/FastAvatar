@@ -14,13 +14,11 @@
 
 import os
 import traceback
-import time
 import torch
 import argparse
 import json
 import shutil
 import numpy as np
-from PIL import Image
 from glob import glob
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
@@ -60,9 +58,7 @@ def generate_camera_rotation(base_c2w, base_intr, num_frames):
 
     R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim,
                                   at=target_pos[None], device=device)
-
-    # More elegant way: apply coordinate correction directly to R
-    R[:, :3, :2] *= -1  # Fix X and Y axes in rotation matrix
+    R[:, :3, :2] *= -1 
     
     c2ws = []
     intrs = []
@@ -424,13 +420,11 @@ class FastAvatarInferrer(Inferrer):
 
     def process_multiview_input(self, input_path, inference_N_frames):
         """Process input using single image FLAME tracking for each view (MultiView mode)"""
-        # Base directory for multiview tracking outputs (sibling to save_tmp), named exactly 'tracking_output'
         norm_save_tmp = os.path.normpath(self.cfg.save_tmp_dump)
         parts = norm_save_tmp.split(os.sep)
         assert 'save_tmp' in parts, f"Expected 'save_tmp' in save_tmp_dump path: {self.cfg.save_tmp_dump}"
         idx = parts.index('save_tmp')
         base = os.sep.join(parts[:idx])
-        # Put views directly under tracking_output (no extra nested levels)
         tracking_output_dir = os.path.join(base, 'tracking_output')
         os.makedirs(tracking_output_dir, exist_ok=True)
         
@@ -698,12 +692,10 @@ class FastAvatarInferrer(Inferrer):
         )
         print("Motion sequences prepared successfully")
 
-        c2ws.append(motion_seqs["c2ws"])  # Already has batch dim
+        c2ws.append(motion_seqs["c2ws"])
 
-        # Use input FLAME parameters for shape, motion FLAME parameters for pose/expression
         inf_flame_params = motion_seqs["flame_params"]
         
-        # Stack all collected data (maintaining batch dimension)
         target_c2ws = torch.cat(c2ws, dim=1)  # [1, N_target, 4, 4] - for rendering
         target_intrs = motion_seqs["intrs"]  # Already has batch dim [1, N_target, 4, 4] - for rendering
         
@@ -711,51 +703,41 @@ class FastAvatarInferrer(Inferrer):
         if self.cfg.get('enable_camera_rotation', False):
             print("Applying camera rotation...")
             
-            # Get base camera parameters (use the first frame as reference)
-            base_c2w = target_c2ws[0, 0]  # [4, 4]
-            base_intr = target_intrs[0, 0]  # [4, 4]
+            base_c2w = target_c2ws[0, 0]
+            base_intr = target_intrs[0, 0]
             
-            # Calculate total frames for rotation (2 complete loops)
             original_frames = target_c2ws.shape[1]
             loops = 1
             total_rotation_frames = original_frames * loops
             
-            # Generate rotated camera parameters
             rotated_c2ws, rotated_intrs = generate_camera_rotation(
                 base_c2w, base_intr, total_rotation_frames
             )
             
-            # Add batch dimension
-            rotated_c2ws = rotated_c2ws.unsqueeze(0)  # [1, N_rotated, 4, 4]
-            rotated_intrs = rotated_intrs.unsqueeze(0)  # [1, N_rotated, 4, 4]
+            rotated_c2ws = rotated_c2ws.unsqueeze(0)
+            rotated_intrs = rotated_intrs.unsqueeze(0)
             
-            # Replace target camera parameters with rotated ones
             target_c2ws = rotated_c2ws
             target_intrs = rotated_intrs
             
-            # Extend FLAME parameters to match the new frame count
             for k in inf_flame_params:
                 if inf_flame_params[k].shape[1] == original_frames:
-                    # Repeat FLAME parameters to match rotation frames
                     repeated_params = []
                     for loop in range(loops):
                         repeated_params.append(inf_flame_params[k])
                     inf_flame_params[k] = torch.cat(repeated_params, dim=1)
             
-            # Extend background colors to match the new frame count
-            original_bg_colors = motion_seqs["bg_colors"]  # [1, N_original, 3]
+            original_bg_colors = motion_seqs["bg_colors"]
             repeated_bg_colors = []
             for loop in range(loops):
                 repeated_bg_colors.append(original_bg_colors)
-            target_bg_colors = torch.cat(repeated_bg_colors, dim=1)  # [1, N_rotated, 3]
+            target_bg_colors = torch.cat(repeated_bg_colors, dim=1)
             
             print(f"Camera rotation applied: {original_frames} frames -> {total_rotation_frames} frames")
             print(f"Loops: {loops}")
         else:
-            # Use original target background colors
-            target_bg_colors = motion_seqs["bg_colors"]  # [1, N_target, 3]
+            target_bg_colors = motion_seqs["bg_colors"]
         
-        # Assert that camera parameters have the same shape as background colors
         assert target_c2ws.shape[1] == target_bg_colors.shape[1], f"Camera frames ({target_c2ws.shape[1]}) must match background color frames ({target_bg_colors.shape[1]})"
         assert target_intrs.shape[1] == target_bg_colors.shape[1], f"Intrinsic frames ({target_intrs.shape[1]}) must match background color frames ({target_bg_colors.shape[1]})"
         

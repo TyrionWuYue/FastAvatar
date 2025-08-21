@@ -59,7 +59,7 @@ huggingface-cli download TyrionWuY/FastAvatar --local-dir ./model_zoo/fastavatar
 ```bash
 bash scripts/infer/infer.sh ${CONFIG} ${MODEL_NAME} ${IMAGE_INPUT} ${MOTION_SEQS_DIR} ${INFERENCE_N_FRAMES} ${MODE}
 ```
-IMAGE_INPUT can be either a .mp4 video file or a folder path containing arbitrary number of images. INFERENCE_N_FRAMES is used to control the number of frames input to the model. MODE has two options: 'Monocular' and 'MultiView'.
+`IMAGE_INPUT` can be either a .mp4 video file or a folder path containing arbitrary number of images. `INFERENCE_N_FRAMES` is used to control the number of frames input to the model. `MODE` has two options: 'Monocular' and 'MultiView'.
 
 
 ### Acknowledgement
