@@ -5,7 +5,9 @@
 
 [Yue Wu](https://tyrionwuyue.github.io/), [Yufan Wu](https://github.com/EavianWoo), [Wen Li](https://github.com/lililuya),  [Yuxi Lu](orcid.org/0000-0003-1205-3524), [Kairui Feng*](https://kelvinfkr.github.io/), [Xuanhong Chen*](https://github.com/neuralchen)
 
-**Tongji University**; **Shanghai Innovation Institute**; **Shanghai Jiao Tong University**; **AKool Research**
+**Tongji University**; **Shanghai Innovation Institute**; **Shanghai Jiao Tong University**; **AKool**
+
+***\* Corresponding Author***
 </div>
 
 <p align="center">
