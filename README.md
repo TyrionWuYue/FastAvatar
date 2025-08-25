@@ -41,7 +41,7 @@ FastAvatar is a **feedforward** 3D avatar framework capable of flexibly leveragi
 
 ## 🚀 Get Started
 
-### Enviroment Setup
+### Environment Setup
 
 ```bash
 git clone https://github.com/TyrionWuYue/FastAvatar.git
