@@ -81,3 +81,15 @@ This work is built on many amazing research works and open-source projects:
 - [VHAP](https://github.com/ShenhanQian/VHAP)
 
 Thanks for their excellent works and great contribution.
+
+```bibtex
+@misc{wu2025fastavatarunifiedfasthighfidelity,
+      title={FastAvatar: Towards Unified Fast High-Fidelity 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers}, 
+      author={Yue Wu and Yufan Wu and Wen Li and Yuxi Lu and Kairui Feng and Xuanhong Chen},
+      year={2025},
+      eprint={2508.19754},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2508.19754}, 
+}
+```
