@@ -4,7 +4,7 @@
 <a href="https://tyrionwuyue.github.io/project_FastAvatar/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
 <a href="https://arxiv.org/abs/2508.19754"><img src="https://img.shields.io/badge/arXiv-2503.11651-b31b1b" alt="arXiv"></a>
 
-[Yue Wu](https://tyrionwuyue.github.io/), [Yufan Wu](https://github.com/EavianWoo), [Wen Li](https://github.com/lililuya),  [Yuxi Lu](orcid.org/0000-0003-1205-3524), [Kairui Feng*](https://kelvinfkr.github.io/), [Xuanhong Chen*](https://github.com/neuralchen)
+[Yue Wu](https://tyrionwuyue.github.io/), [Xuanhong Chen*](https://github.com/neuralchen), [Yufan Wu](https://github.com/EavianWoo), [Wen Li](https://github.com/lililuya),  [Yuxi Lu](orcid.org/0000-0003-1205-3524), [Kairui Feng](https://kelvinfkr.github.io/)
 
 **Tongji University**; **Shanghai Innovation Institute**; **Shanghai Jiao Tong University**; **AKool**
 
