@@ -1,4 +1,4 @@
-# FastAvatar: Towards Unified Fast High-Fidelity 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers
+# [ICLR 2026] FastAvatar: Towards Unified and Fast 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers
 
 <div align="center">
 <a href="https://tyrionwuyue.github.io/project_FastAvatar/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
