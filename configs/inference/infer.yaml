@@ -2,11 +2,15 @@ experiment:
     type: fastavatar
     seed: 42
     parent: fastavatar
-    child: fastavatar-multi-frame
+    child: fastavatar
 
-model: 
+model:
+    pretrained_model_path: "./model_zoo/fastavatar/model.safetensors"
+
     # image encoder
-    encoder_type: "dinov2_fusion"
+    encoder_path: "./model_zoo/DINO/dinov2.safetensors"
+    source_image_res: 512
+    encoder_grad_ckpt: true
     encoder_model_name: "dinov2_vitl14_reg"
     encoder_feat_dim: 1024
     encoder_freeze: true
@@ -15,46 +19,20 @@ model:
     pcl_dim: 1024
 
     # transformer
-    encoder_grad_ckpt: true
+    num_base_frames: 16
+    if_framepack: true
+    framepack_compression_level: 8  # [2, 4, 8]
     transformer_dim: 1024
+    context_attn_layers: 8
     transformer_layers: 10
     transformer_heads: 16
     tf_grad_ckpt: true
-    aa_order: ["frame", "global"]
-    aa_block_size: 1
-    post_fusion: false
-    
-    # Multi-frame control
-    use_multi_frame_pc: true
-    conf_loss_frames: 2  # Number of frames to use for confidence loss calculation
-
-    # FLAME token config
-    use_flame_tokens: true
-    flame_encoder_config:
-        # FLAME parameter dimensions (set to 0 to disable)
-        expr_dim: 100
-        rotation_dim: 3
-        neck_pose_dim: 3
-        jaw_pose_dim: 3
-        eyes_pose_dim: 6
-        translation_dim: 3
-
-        hidden_dim: 256  
-        output_dim: 1024
-        dropout: 0.0
-
-    # Camera token config
-    use_camera_tokens: true
-    camera_encoder_config:
-        hidden_dim: 256
-        output_dim: 1024
-        dropout: 0.0
+    aa_order: ["global", "frame"]
 
     # for gs renderer
-    num_sliced_frames: 8
+    renderer_freeze: false
     human_model_path: "./model_zoo/human_parametric_models"
     flame_subdivide_num: 1
-    flame_type: "flame"
     gs_query_dim: 1024
     gs_use_rgb: true
     gs_sh: 3
@@ -65,34 +43,36 @@ model:
     gs_xyz_offset_max_step: 0.2
     gs_clip_scaling: 0.01
     scale_sphere: false
-    
-    
-    expr_param_dim: 10
-    shape_param_dim: 10
     add_teeth: true
-
     fix_opacity: false
     fix_rotation: false
-
-    has_disc: false
-
     teeth_bs_flag: false
     oral_mesh_flag: true
-    flame_scale: 1.0
+    gs_pruning: false
+    rendering_chunk_size_train: 16
+    rendering_chunk_size_infer: 128
 
 dataset:
-    repeat_num: 1
-    root_dirs: "/inspire/hdd/global_user/fengkairui-25026/wuyue/nersemble_FLAME"
-    meta_path: "./datasets/nersemble_uids_unified.json"
-    task_type: "unified"  # Options: "monocular", "multi-view", "unified"
-    input_frames: 16
-    frames_per_sample: 32
+    input_frames: 256
+    target_frames: 16
     render_image_res: 512
     source_image_res: 512
-    num_train_workers: 4
-    num_val_workers: 2
+    num_train_workers: 2
+    num_val_workers: 1
     pin_mem: true
-    val_num: 160
+    val_num: 128
+    multiply: 2
+    # Multiple datasets config
+    meta_path: "./datasets/mixed_uids.json"
+    datasets:
+        nersemble:
+            root_dir: "/inspire/qb-ilm/project/urbanlowaltitude/fengkairui-25026/wuyue/data/NersembleFLAME"
+            task_type: "unified"
+            val_id: [] # '309', '146', '123', '370', '204'
+        vfhq:
+            root_dir: "/inspire/qb-ilm/project/urbanlowaltitude/fengkairui-25026/wuyue/data/VFHQFLAME"
+            task_type: "monocular"
+            val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
     render_image:
         low: 512
         high: 512
@@ -100,46 +80,46 @@ dataset:
 
 train:
     gradient_checkpointing: true
-    mixed_precision: bf16
     find_unused_parameters: true
     loss:
-        pixel_weight: 0.8
-        conf_weight: 1.0
-        perceptual_weight: 0.05
-        ssim_weight: 0.05
+        pixel_loss_type: "l1"
+        pixel_weight: 1.0
+        perceptual_weight: 1.0
+        ssim_weight: 0.1
+        offset_weight: 0.1
         tracking_weight: 0.01
-        tv_weight: -1
-        conf_alpha: 0.2
+        pruning_weight: -1 # 0.0005
+        identity_weight: 0.1
+        arcface_checkpoint: "./model_zoo/arcface/arcface_checkpoint.tar"
     optim:
-        global_attn_lr: 1e-4     # Global attention (random initialization)
-        other_lr: 4e-5           # All other parameters (pretrained models)
-        
-        weight_decay: 0.05
+        lr: 1e-5
+        heads_lr_scale: 5
+        weight_decay: 0.001
         beta1: 0.9
         beta2: 0.95
-        clip_grad_norm: 1.0
+        clip_grad_norm: 0
     scheduler:
         type: cosine
-        warmup_real_iters: 8000
+        warmup_real_iters: 0
     batch_size: 1
-    accum_steps: 1
-    epochs: 50
+    accum_steps: 8
+    epochs: 5
     debug_global_steps: null
     resume: ""
 
 val:
-    batch_size: 2
+    batch_size: 1
     global_step_period: 500
     debug_batches: null
     save_images: true
     save_dir: "./exps/val_perf"
-    samples_per_save: 5
+    samples_per_save: 2
 
 saver:
     auto_resume: true
     load_model: null
     checkpoint_root: "./exps/checkpoints"
-    checkpoint_global_steps: 1000
+    checkpoint_global_steps: 500
     checkpoint_keep_level: 3
 
 logger:
@@ -150,9 +130,6 @@ logger:
     enable_profiler: false
     trackers:
         - tensorboard
-    image_monitor:
-        train_global_steps: 999999
-        samples_per_log: 2
 
 compile:
     suppress_errors: true

@@ -10,9 +10,8 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from accelerate.logging import get_logger
 from collections import defaultdict
-import math
 
-from FastAvatar.runners.infer.head_utils import prepare_motion_seqs, load_flame_params
+from FastAvatar.runners.infer.utils import prepare_motion_seqs, load_flame_params
 from FastAvatar.runners.infer.base_inferrer import Inferrer
 from FastAvatar.datasets.cam_utils import build_camera_principle, build_camera_standard, surrounding_views_linspace, create_intrinsics
 from FastAvatar.runners import REGISTRY_RUNNERS

@@ -15,6 +15,10 @@
     <img src="./assets/images/teaser.png" width="100%">
 </p>
 
+## 📢 News
+- **[2026/03/01]** 🚀 Released new model weights and training code.
+- **[2026/01/26]** 🎉🎉🎉 Accepted to ICLR 2026.
+
 ## 🔥 Overview
 FastAvatar is a **feedforward** 3D avatar framework capable of flexibly leveraging diverse daily recordings (e.g., a single image, multi-view observations, or monocular video) to reconstruct a high-quality 3D Gaussian Splatting (3DGS) model **within seconds**, using only a single **unified** model.
 
@@ -62,7 +66,7 @@ huggingface-cli download TyrionWuY/FastAvatar-assets --local-dir ./tmp
 tar -xf ./tmp/assets.tar 
 tar -xf ./tmp/model_zoo.tar
 rm -r ./tmp/
-# Download Model Weihts
+# Download Model Weights
 huggingface-cli download TyrionWuY/FastAvatar --local-dir ./model_zoo/fastavatar/
 ```
 
