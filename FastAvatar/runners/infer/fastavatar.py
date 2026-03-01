@@ -1,17 +1,3 @@
-# Copyright (c) 2024-2025, The Alibaba 3DAIGC Team Authors. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import os
 import traceback
 import torch
@@ -26,7 +12,7 @@ from accelerate.logging import get_logger
 from collections import defaultdict
 import math
 
-from FastAvatar.runners.infer.head_utils import prepare_motion_seqs, preprocess_image, load_flame_params
+from FastAvatar.runners.infer.head_utils import prepare_motion_seqs, load_flame_params
 from FastAvatar.runners.infer.base_inferrer import Inferrer
 from FastAvatar.datasets.cam_utils import build_camera_principle, build_camera_standard, surrounding_views_linspace, create_intrinsics
 from FastAvatar.runners import REGISTRY_RUNNERS
@@ -805,7 +791,6 @@ class FastAvatarInferrer(Inferrer):
             print(f"Max single frame render: {max_single_frame_render}")
                 
             # Multi-frame inference
-
             res = self.model.infer_images(
                 rgbs,
                 input_c2ws,

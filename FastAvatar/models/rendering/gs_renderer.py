@@ -1,27 +1,8 @@
-# Copyright (c) 2024-2025, The Alibaba 3DAIGC Team Authors. 
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import os
 from collections import defaultdict
-try:
-    from diff_gaussian_rasterization_wda import GaussianRasterizationSettings, GaussianRasterizer
-except:
-    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import math
 from FastAvatar.models.rendering.flame_model.flame import FlameHeadSubdivided
@@ -33,6 +14,51 @@ from einops import rearrange, repeat
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 inverse_sigmoid = lambda x: np.log(x / (1 - x))
+
+
+def _gumbel_sigmoid(input, temperature=1, hard=False, eps = 1e-10):
+    """
+    A gumbel-sigmoid nonlinearity with gumbel(0,1) noize
+    In short, it's a function that mimics #[a>0] indicator where a is the logit
+    
+    Explaination and motivation: https://arxiv.org/abs/1611.01144
+    
+    Math:
+    Sigmoid is a softmax of two logits: a and 0
+    e^a / (e^a + e^0) = 1 / (1 + e^(0 - a)) = sigm(a)
+    
+    Gumbel-sigmoid is a gumbel-softmax for same logits:
+    gumbel_sigm(a) = e^([a+gumbel1]/t) / [ e^([a+gumbel1]/t) + e^(gumbel2/t)]
+    where t is temperature, gumbel1 and gumbel2 are two samples from gumbel noize: -log(-log(uniform(0,1)))
+    gumbel_sigm(a) = 1 / ( 1 +  e^(gumbel2/t - [a+gumbel1]/t) = 1 / ( 1+ e^(-[a + gumbel1 - gumbel2]/t)
+    gumbel_sigm(a) = sigm([a+gumbel1-gumbel2]/t)
+    
+    For computation reasons:
+    gumbel1-gumbel2 = -log(-log(uniform1(0,1)) +log(-log(uniform2(0,1)) = -log( log(uniform2(0,1)) / log(uniform1(0,1)) )
+    gumbel_sigm(a) = sigm([a-log(log(uniform2(0,1))/log(uniform1(0,1))]/t)
+    
+    
+    :param t: temperature of sampling. Lower means more spike-like sampling. Can be symbolic.
+    :param eps: a small number used for numerical stability
+    :returns: a callable that can (and should) be used as a nonlinearity
+    """
+    with torch.no_grad():
+        # generate a random sample from the uniform distribution
+        uniform1 = torch.rand(input.size())
+        uniform2 = torch.rand(input.size())
+        gumbel_noise = -torch.log(torch.log(uniform1 + eps)/torch.log(uniform2 + eps) + eps).cuda()
+
+    reparam = (input + gumbel_noise)/temperature
+
+    y_soft = torch.sigmoid(reparam)     
+    if hard:
+        # Straight through.
+        index = (y_soft > 0.5).nonzero(as_tuple=True)[0] 
+        y_hard = torch.zeros_like(input, memory_format=torch.legacy_contiguous_format).scatter_(-1, index, 1.0)
+        ret = y_hard - y_soft.detach() + y_soft
+    else:
+        ret = y_soft
+    return ret
 
 
 def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
@@ -47,6 +73,7 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     C2W[:3, 3] = cam_center
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
+
 
 def getProjectionMatrix(znear, zfar, fovX, fovY):
     tanHalfFovY = math.tan((fovY / 2))
@@ -69,6 +96,7 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[2, 2] = z_sign * zfar / (zfar - znear)
     P[2, 3] = -(zfar * znear) / (zfar - znear)
     return P
+
 
 def intrinsic_to_fov(intrinsic, w, h):
     fx, fy = intrinsic[0, 0], intrinsic[1, 1]
@@ -117,6 +145,7 @@ class GSLayer(nn.Module):
                  fix_rotation=False,
                  use_fine_feat=False,
                  pred_res=False,
+                 gs_pruning=False,
                  ):
         super().__init__()
         self.clip_scaling = clip_scaling
@@ -129,18 +158,21 @@ class GSLayer(nn.Module):
         self.use_fine_feat = use_fine_feat
         self.scale_sphere = scale_sphere
         self.pred_res = pred_res
+        self.gs_pruning = gs_pruning
         
         self.attr_dict ={
             "shs": (sh_degree + 1) ** 2 * 3,
             "scaling": 3 if not scale_sphere else 1,
             "xyz": 3,
             "opacity": None,
-            "rotation": None 
+            "rotation": None,
         }
         if not self.fix_opacity:
             self.attr_dict["opacity"] = 1
         if not self.fix_rotation:
             self.attr_dict["rotation"] = 4
+        if self.gs_pruning:
+            self.attr_dict["importance"] = 1
         
         self.out_layers = nn.ModuleDict()
         for key, out_ch in self.attr_dict.items():
@@ -173,6 +205,9 @@ class GSLayer(nn.Module):
             elif key == "opacity":
                 if not self.fix_opacity:
                     nn.init.constant_(layer.bias, inverse_sigmoid(init_density))
+            elif key == "importance":
+                if self.gs_pruning:
+                    nn.init.constant_(layer.bias, 3.0)
             self.out_layers[key] = layer
             
         if self.use_fine_feat:
@@ -235,6 +270,9 @@ class GSLayer(nn.Module):
                         v_fine = self.out_layers["fine_shs"](x_fine)
                         v = v + v_fine
                 v = torch.reshape(v, (v.shape[0], -1, 3))
+            elif k == "importance":
+                if self.gs_pruning:
+                    pass
             elif k == "xyz":
                 # TODO check
                 if self.restrict_offset:
@@ -290,7 +328,7 @@ class PointEmbed(nn.Module):
 
 
 class GS3DRenderer(nn.Module):
-    def __init__(self, human_model_path, subdivide_num, smpl_type, feat_dim, query_dim, 
+    def __init__(self, human_model_path, subdivide_num, feat_dim, query_dim, 
                  use_rgb, sh_degree, xyz_offset_max_step, mlp_network_config,
                  clip_scaling=0.2,
                  scale_sphere=False,
@@ -302,18 +340,18 @@ class GS3DRenderer(nn.Module):
                  add_teeth=True,
                  teeth_bs_flag=False,
                  oral_mesh_flag=False,
+                 gs_pruning=False,
                  **kwargs,
                  ):
         super().__init__()
         print(f"#########scale sphere:{scale_sphere}, add_teeth:{add_teeth}")
         self.gradient_checkpointing = gradient_checkpointing
         self.skip_decoder = skip_decoder
-        self.smpl_type = smpl_type
-        assert self.smpl_type == "flame"
         self.sym_rend2 = True
         self.teeth_bs_flag = teeth_bs_flag
         self.oral_mesh_flag = oral_mesh_flag
         self.render_rgb = kwargs.get("render_rgb", True)
+        self.gs_pruning = gs_pruning
         print("==="*16*3, "\n Render rgb:", self.render_rgb, "\n"+"==="*16*3)
         
         self.scaling_modifier = 1.0
@@ -343,8 +381,6 @@ class GS3DRenderer(nn.Module):
 
         init_scaling = -5.0
         
-        
-        num_points = self.flame_model.vertex_num_upsampled
         self.gs_net = GSLayer(in_channels=query_dim,
                               use_rgb=use_rgb,
                               sh_degree=self.sh_degree,
@@ -358,6 +394,7 @@ class GS3DRenderer(nn.Module):
                               fix_opacity=fix_opacity,
                               fix_rotation=fix_rotation,
                               use_fine_feat=True if decode_with_extra_info is not None and decode_with_extra_info["type"] is not None else False,
+                              gs_pruning=gs_pruning,
                               )
         
     def forward_single_view(self,
@@ -396,7 +433,6 @@ class GS3DRenderer(nn.Module):
         )
 
         rasterizer = GSR(raster_settings=raster_settings)
-
         means3D = gs.xyz
         means2D = screenspace_points
         opacity = gs.opacity
@@ -435,8 +471,8 @@ class GS3DRenderer(nn.Module):
         ret = {
             "comp_rgb": rendered_image.permute(1, 2, 0),  # [H, W, 3]
             "comp_rgb_bg": bg_color,
-            'comp_mask': rendered_alpha.permute(1, 2, 0),
-            'comp_depth': rendered_depth.permute(1, 2, 0),
+            # "comp_mask": rendered_alpha.permute(1, 2, 0),
+            # "comp_depth": rendered_depth.permute(1, 2, 0),
         }
 
         return ret
@@ -481,12 +517,11 @@ class GS3DRenderer(nn.Module):
                                                 zero_centered_at_root_node=False,
                                                 return_landmarks=False,
                                                 return_verts_cano=False,
-                                                # static_offset=flame_data['static_offset'].to('cuda'),
                                                 static_offset=None,
                                                 num_input_frames=num_input_frames,
                                                 )
             mean_3d = ret["animated"]
-            
+        
         gs_attr_list = []                                                                  
         for i in range(num_view):
             gs_attr_copy = GaussianModel(xyz=mean_3d[i],
@@ -494,7 +529,8 @@ class GS3DRenderer(nn.Module):
                                     rotation=gs_attr.rotation, 
                                     scaling=gs_attr.scaling,
                                     shs=gs_attr.shs,
-                                    offset=gs_attr.offset) # [N, 3]
+                                    offset=gs_attr.offset,
+                                    importance=gs_attr.importance) # [N, 3]
             gs_attr_list.append(gs_attr_copy)
         
         return gs_attr_list
@@ -505,12 +541,20 @@ class GS3DRenderer(nn.Module):
         x: [N, C] Float[Tensor, "Np Cp"],
         query_points: [N, 3] Float[Tensor, "Np 3"]        
         """
-        device = x.device
+        N_points = x.shape[0]
+        num_points_per_frame = self.flame_model.vertex_num_upsampled
+        
+        # Calculate number of frames and assert divisibility
+        num_frames = N_points // num_points_per_frame
+        assert N_points % num_points_per_frame == 0, f"Total points {N_points} must be divisible by points per frame {num_points_per_frame}"
+        
+        # Process all frames at once
         if self.mlp_network_config is not None:
             x = self.mlp_net(x)
             if x_fine is not None:
                 x_fine = self.mlp_net(x_fine)
         gs_attr: GaussianModel = self.gs_net(x, query_points, x_fine, vtx_sym_idxs=vtx_sym_idxs)
+        
         return gs_attr
             
 
@@ -630,18 +674,44 @@ class GS3DRenderer(nn.Module):
         return gs_model_list, query_points, flame_data, query_gs_features
 
     def forward_animate_gs(self, gs_model_list, query_points, flame_data, c2w, intrinsic, height, width,
-                           background_color, num_input_frames, debug=False):
+                           background_color, num_input_frames, debug=False, masks=None):
         batch_size = len(gs_model_list)
         out_list = []
 
         for b in range(batch_size):
             gs_model = gs_model_list[b]
             query_pt = query_points[b]
+            mask = masks[b] if masks is not None else None
             animatable_gs_model_list: list[GaussianModel] = self.animate_gs_model(gs_model,
                                                                                   query_pt,
                                                                                   self.get_sing_batch_smpl_data(flame_data, b),
                                                                                   num_input_frames=num_input_frames,
                                                                                   debug=debug)
+            
+            # Apply pruning to animated gaussians if mask is provided
+            if mask is not None:
+                if self.training:
+                    # Training: soft pruning - modulate opacity, keep all gaussians
+                    for gs_animated in animatable_gs_model_list:
+                        mask_expanded = mask.unsqueeze(-1) if len(mask.shape) == 1 else mask
+                        gs_animated.opacity = gs_animated.opacity * mask_expanded
+                else:
+                    # Inference: hard pruning via indexing
+                    mask_bool = mask.bool() if mask.dtype != torch.bool else mask
+                    pruned_gs_model_list = []
+                    for gs_animated in animatable_gs_model_list:
+                        pruned_gs = GaussianModel(
+                            xyz=gs_animated.xyz[mask_bool],
+                            opacity=gs_animated.opacity[mask_bool],
+                            rotation=gs_animated.rotation[mask_bool],
+                            scaling=gs_animated.scaling[mask_bool],
+                            shs=gs_animated.shs[mask_bool],
+                            offset=gs_animated.offset[mask_bool] if gs_animated.offset is not None else None,
+                            importance=gs_animated.importance[mask_bool] if gs_animated.importance is not None else None
+                        )
+                        pruned_gs_model_list.append(pruned_gs)
+                    animatable_gs_model_list = pruned_gs_model_list
+            
             assert len(animatable_gs_model_list) == c2w.shape[1]
             out_list.append(self.forward_single_batch(
                 animatable_gs_model_list,
@@ -655,13 +725,17 @@ class GS3DRenderer(nn.Module):
         for out_ in out_list:
             for k, v in out_.items():
                 out[k].append(v)
+        
         for k, v in out.items():
-            if isinstance(v[0], torch.Tensor):
+            if k == "pruning_masks":
+                continue
+            elif isinstance(v[0], torch.Tensor):
                 out[k] = torch.stack(v, dim=0)
             else:
                 out[k] = v
                 
-        render_keys = ["comp_rgb", "comp_mask", "comp_depth"]
+        # render_keys = ["comp_rgb", "comp_mask", "comp_depth"]
+        render_keys = ["comp_rgb"]
         for key in render_keys:
             out[key] = rearrange(out[key], "b v h w c -> b v c h w")
         
@@ -718,6 +792,68 @@ class GS3DRenderer(nn.Module):
         gs_model_list, query_points, flame_data, query_gs_features = self.forward_gs(gs_hidden_features, query_points, flame_data=flame_data,
                                                                       additional_features=additional_features, debug=debug)
 
-        out = self.forward_animate_gs(gs_model_list, query_points, flame_data, c2w, intrinsic, height, width, background_color, num_input_frames, debug)
+        if self.gs_pruning:
+            gs_stats, masks = self.compute_pruning_stats(gs_model_list)
+        else:
+            gs_stats = None
+            masks = None
+
+        out = self.forward_animate_gs(gs_model_list, query_points, flame_data, c2w, intrinsic, height, width, background_color, num_input_frames, debug, masks=masks)
         
+        if gs_stats is not None:
+            out['gs_stats'] = gs_stats
+
+        # Collect importance values from gs_model_list for loss calculation (continuous values with gradients)
+        if gs_model_list and hasattr(gs_model_list[0], 'importance') and gs_model_list[0].importance is not None:
+            importance_values = torch.cat([gs_model.importance for gs_model in gs_model_list], dim=0)  # [B*N_points]
+            out['pruning_importance'] = importance_values
+
+        # Collect offset values from gs_model_list for loss calculation
+        if gs_model_list and hasattr(gs_model_list[0], 'offset') and gs_model_list[0].offset is not None:
+            offsets = torch.cat([gs_model.offset for gs_model in gs_model_list], dim=0)  # [B*N_points, 3]
+            out['offsets'] = offsets
+
         return out
+    
+
+    def compute_pruning_stats(self, gs_model_list):
+        """
+        Compute pruning statistics without actually pruning the gaussians
+        """
+        before_counts = []
+        after_counts = []
+        masks = []
+        
+        for gs_model in gs_model_list:
+            original_count = gs_model.xyz.shape[0]
+            before_counts.append(original_count)
+
+            if gs_model.importance is not None:
+                if self.training:
+                    # Training: return continuous mask for soft pruning
+                    prune_mask = _gumbel_sigmoid(gs_model.importance.squeeze(), temperature=1.0, hard=False)
+                    masks.append(prune_mask)
+                    kept_count = (prune_mask > 0.5).sum().item()
+                else:
+                    # Inference: return binary mask for hard pruning
+                    binary_mask = _gumbel_sigmoid(gs_model.importance.squeeze(), temperature=1.0, hard=True)
+                    masks.append(binary_mask)
+                    kept_count = binary_mask.sum().item()
+
+                after_counts.append(kept_count)
+            else:
+                after_counts.append(original_count)
+                masks.append(None)
+
+        # Calculate statistics
+        avg_remaining_gs = sum(after_counts) / len(after_counts) if after_counts else 0
+        total_before = sum(before_counts)
+        total_after = sum(after_counts)
+        prune_percentage = ((total_before - total_after) / total_before * 100) if total_before > 0 else 0
+
+        gs_stats = {
+            'avg_remaining_gs': avg_remaining_gs,
+            'prune_percentage': prune_percentage
+        }
+
+        return gs_stats, masks

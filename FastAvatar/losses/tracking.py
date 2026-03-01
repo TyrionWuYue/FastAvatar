@@ -73,7 +73,6 @@ class TrackingLoss(nn.Module):
     """
     def __init__(
         self,
-        gamma: float = 0.8,
         add_huber_loss: bool = True,
         loss_only_for_visible: bool = True,
         expected_dist_thresh: float = 12.0,
@@ -82,13 +81,11 @@ class TrackingLoss(nn.Module):
         Initialize the tracking loss module.
 
         Args:
-            gamma (float): Weight decay factor for multi-scale predictions. Default: 0.8
-            add_huber_loss (bool): Whether to use Huber loss instead of L1 loss. Default: False
-            loss_only_for_visible (bool): Whether to compute loss only for visible points. Default: False
+            add_huber_loss (bool): Whether to use Huber loss instead of L1 loss. Default: True
+            loss_only_for_visible (bool): Whether to compute loss only for visible points. Default: True
             expected_dist_thresh (float): Threshold for probability loss. Default: 12.0
         """
         super().__init__()
-        self.gamma = gamma
         self.add_huber_loss = add_huber_loss
         self.loss_only_for_visible = loss_only_for_visible
         self.expected_dist_thresh = expected_dist_thresh
@@ -153,12 +150,12 @@ class TrackingLoss(nn.Module):
         visibility: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
-        Compute all tracking losses.
+        Compute all tracking losses across multiple iterations.
 
         Args:
-            flow_preds: List of predicted flow tensors
-            flow_gt: List of ground truth flow tensors
-            valids: List of validity masks
+            flow_preds: List of predicted flow tensors, one per iteration [B, S, N, 2]
+            flow_gt: List of ground truth flow tensors, one per iteration [B, S, N, 2]
+            valids: List of validity masks, one per iteration [B, S, N]
             vis_preds: List of predicted visibility tensors
             vis_gts: List of ground truth visibility tensors
             tracks: List of tracked point tensors
@@ -167,19 +164,35 @@ class TrackingLoss(nn.Module):
             visibility: List of visibility masks
 
         Returns:
-            Total loss combining all components
+            Total loss
         """
+        n_iters = len(flow_preds)
         total_loss = 0.0
 
-        # Add flow loss
-        total_loss += self.sequence_loss(flow_preds, flow_gt, valids, visibility)
+        # Iterate over each prediction iteration (equal weights)
+        for iter_idx in range(n_iters):
+            # Flow loss for this iteration
+            flow_loss = self.sequence_loss(
+                flow_preds[iter_idx], 
+                flow_gt[iter_idx], 
+                valids[iter_idx], 
+                visibility[iter_idx] if visibility is not None else None
+            )
+            total_loss += flow_loss
 
-        # Add visibility loss if provided
-        if vis_preds is not None and vis_gts is not None:
-            total_loss += self.sequence_BCE_loss(vis_preds, vis_gts).mean()
+            # Visibility loss if provided
+            if vis_preds is not None and vis_gts is not None:
+                vis_loss = self.sequence_BCE_loss(vis_preds[iter_idx], vis_gts[iter_idx])
+                total_loss += vis_loss.mean()
 
-        # Add probability loss if provided
-        if tracks is not None and confidence is not None and target_points is not None and visibility is not None:
-            total_loss += self.sequence_prob_loss(tracks, confidence, target_points, visibility).mean()
+            # Probability loss if provided
+            if (tracks is not None and confidence is not None and 
+                target_points is not None and visibility is not None):
+                prob_loss = self.sequence_prob_loss(
+                    tracks[iter_idx], confidence[iter_idx], 
+                    target_points[iter_idx], visibility[iter_idx]
+                )
+                total_loss += prob_loss.mean()
 
-        return total_loss
+        # Average across iterations
+        return total_loss / n_iters

@@ -437,13 +437,11 @@ class FlameTrackingMultiImage:
         os.makedirs(landmark_output_dir, exist_ok=True)
 
         # Step 1: Process all images for head detection and matting
-        logger.info('Step 1: Processing images for head detection and matting...')
-        processed_images = []
+        logger.info('Step 1: First pass - finding unified bounding box...')
+        all_bboxes = []
         
         for frame_index, image_path in enumerate(image_files):
             try:
-                logger.info(f'Processing image {frame_index + 1}/{len(image_files)}: {os.path.basename(image_path)}')
-                
                 # Load the original image
                 frame = torchvision.io.read_image(image_path)[:3, ...]
 
@@ -458,16 +456,46 @@ class FlameTrackingMultiImage:
                     logger.error(f'Failed to detect head in {image_path}')
                     continue
                 
-                # Expand bounding box
-                frame_bbox = expand_bbox(frame_bbox, scale=1.65).long()
+                all_bboxes.append(frame_bbox.cpu())
+            except Exception as e:
+                logger.error(f'Error processing image {image_path}: {e}')
+                continue
+                
+        if len(all_bboxes) == 0:
+            logger.error('No faces detected in any frame')
+            return ERROR_CODE['FailedToDetect']
+            
+        all_bboxes_tensor = torch.stack(all_bboxes)
+        unified_bbox_raw = torch.tensor([
+            all_bboxes_tensor[:, 0].min().item(),
+            all_bboxes_tensor[:, 1].min().item(),
+            all_bboxes_tensor[:, 2].max().item(),
+            all_bboxes_tensor[:, 3].max().item(),
+        ]).long()
+        
+        unified_bbox = expand_bbox(unified_bbox_raw, scale=1.65).long()
+        logger.info(f"Using unified bbox: {unified_bbox.tolist()}")
+        
+        logger.info('Step 1.5: Second pass - cropping and matting...')
+        processed_images = []
+        
+        exp_height = unified_bbox[3] - unified_bbox[1]
+        exp_width = unified_bbox[2] - unified_bbox[0]
+        
+        for frame_index, image_path in enumerate(image_files):
+            try:
+                logger.info(f'Processing image {frame_index + 1}/{len(image_files)}: {os.path.basename(image_path)}')
+                
+                # Load the original image
+                frame = torchvision.io.read_image(image_path)[:3, ...]
 
                 # Crop and resize
                 cropped_frame = torchvision.transforms.functional.crop(
                     frame,
-                    top=frame_bbox[1],
-                    left=frame_bbox[0],
-                    height=frame_bbox[3] - frame_bbox[1],
-                    width=frame_bbox[2] - frame_bbox[0])
+                    top=unified_bbox[1],
+                    left=unified_bbox[0],
+                    height=exp_height,
+                    width=exp_width)
                 cropped_frame = torchvision.transforms.functional.resize(
                     cropped_frame, (1024, 1024), antialias=True)
 

@@ -14,8 +14,6 @@ from typing import List, Dict, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .head_act import activate_head
-from .utils import create_uv_grid, position_grid_to_embed
 
 
 class DPTHead(nn.Module):
@@ -38,7 +36,6 @@ class DPTHead(nn.Module):
         pos_embed (bool, optional): Whether to use positional embedding. Default is True.
         feature_only (bool, optional): If True, return features only without the last several layers and activation head. Default is False.
         down_ratio (int, optional): Downscaling factor for the output resolution. Default is 1.
-        use_flame_tokens (bool, optional): Whether to use flame tokens. Default is False.
     """
 
     def __init__(
@@ -54,7 +51,6 @@ class DPTHead(nn.Module):
         pos_embed: bool = True,
         feature_only: bool = False,
         down_ratio: int = 1,
-        use_flame_tokens: bool = False,
     ) -> None:
         super(DPTHead, self).__init__()
         self.patch_size = patch_size
@@ -64,7 +60,6 @@ class DPTHead(nn.Module):
         self.feature_only = feature_only
         self.down_ratio = down_ratio
         self.intermediate_layer_idx = intermediate_layer_idx
-        self.use_flame_tokens = use_flame_tokens
 
         self.norm = nn.LayerNorm(dim_in)
 
@@ -187,6 +182,7 @@ class DPTHead(nn.Module):
 
         Args:
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
+                Each element has shape [B*S_total, P, C] where frames are folded into first dimension.
             images (Tensor): Input images with shape [B, S, 3, H, W].
             patch_start_idx (int): Starting index for patch tokens.
             frames_start_idx (int, optional): Starting index for frames to process.
@@ -199,23 +195,34 @@ class DPTHead(nn.Module):
             images = images[:, frames_start_idx:frames_end_idx].contiguous()
 
         B, S, _, H, W = images.shape
+        
+        # Calculate patch dimensions from image size
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
         out = []
         dpt_idx = 0
 
         for layer_idx in range(len(self.intermediate_layer_idx)):
-            x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
+            # aggregated_tokens_list[layer_idx] has shape [B*S_total, P_total, C]
+            # where S_total is the total number of frames (before chunking)
+            x = aggregated_tokens_list[layer_idx][:, patch_start_idx:, :]  # [B*S_total, P, C]
 
-            # Select frames if processing a chunk
+            # Chunk frames in the FIRST dimension (B*S), not the second (P is patch count!)
             if frames_start_idx is not None and frames_end_idx is not None:
-                x = x[:, frames_start_idx:frames_end_idx]
-
-            x = x.reshape(B * S, -1, x.shape[-1])
+                # Slice the batch*sequence dimension to get the chunk
+                batch_start = B * frames_start_idx
+                batch_end = B * frames_end_idx
+                x = x[batch_start:batch_end]  # [B*S_chunk, P, C]
+            
+            # At this point x should have shape [B*S, P, C]
+            # Verify the reshape will work
+            assert x.shape[0] == B * S, f"Expected first dim {B*S}, got {x.shape[0]}"
 
             x = self.norm(x)
 
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+            # Permute to [B*S, C, P] then reshape to [B*S, C, patch_h, patch_w]
+            x = x.permute(0, 2, 1)  # [B*S, C, P]
+            x = x.reshape(x.shape[0], x.shape[1], patch_h, patch_w)  # [B*S, C, patch_h, patch_w]
 
             x = self.projects[dpt_idx](x)
             if self.pos_embed:
@@ -239,13 +246,13 @@ class DPTHead(nn.Module):
             out = self._apply_pos_embed(out, W, H)
 
         if self.feature_only:
-            return out.view(B, S, *out.shape[1:])
+            return out.reshape(B, S, *out.shape[1:])
 
         out = self.scratch.output_conv2(out)
         preds, conf = activate_head(out, activation=self.activation, conf_activation=self.conf_activation)
 
-        preds = preds.view(B, S, *preds.shape[1:])
-        conf = conf.view(B, S, *conf.shape[1:])
+        preds = preds.reshape(B, S, *preds.shape[1:])
+        conf = conf.reshape(B, S, *conf.shape[1:])
         return preds, conf
 
     def _apply_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
@@ -484,3 +491,128 @@ def custom_interpolate(
         return x.contiguous()
     else:
         return nn.functional.interpolate(x, size=size, mode=mode, align_corners=align_corners)
+
+
+def create_uv_grid(
+    width: int, height: int, aspect_ratio: float = None, dtype: torch.dtype = None, device: torch.device = None
+) -> torch.Tensor:
+    """
+    Create a normalized UV grid of shape (width, height, 2).
+
+    The grid spans horizontally and vertically according to an aspect ratio,
+    ensuring the top-left corner is at (-x_span, -y_span) and the bottom-right
+    corner is at (x_span, y_span), normalized by the diagonal of the plane.
+
+    Args:
+        width (int): Number of points horizontally.
+        height (int): Number of points vertically.
+        aspect_ratio (float, optional): Width-to-height ratio. Defaults to width/height.
+        dtype (torch.dtype, optional): Data type of the resulting tensor.
+        device (torch.device, optional): Device on which the tensor is created.
+
+    Returns:
+        torch.Tensor: A (width, height, 2) tensor of UV coordinates.
+    """
+    # Derive aspect ratio if not explicitly provided
+    if aspect_ratio is None:
+        aspect_ratio = float(width) / float(height)
+
+    # Compute normalized spans for X and Y
+    diag_factor = (aspect_ratio**2 + 1.0) ** 0.5
+    span_x = aspect_ratio / diag_factor
+    span_y = 1.0 / diag_factor
+
+    # Establish the linspace boundaries
+    left_x = -span_x * (width - 1) / width
+    right_x = span_x * (width - 1) / width
+    top_y = -span_y * (height - 1) / height
+    bottom_y = span_y * (height - 1) / height
+
+    # Generate 1D coordinates
+    x_coords = torch.linspace(left_x, right_x, steps=width, dtype=dtype, device=device)
+    y_coords = torch.linspace(top_y, bottom_y, steps=height, dtype=dtype, device=device)
+
+    # Create 2D meshgrid (width x height) and stack into UV
+    uu, vv = torch.meshgrid(x_coords, y_coords, indexing="xy")
+    uv_grid = torch.stack((uu, vv), dim=-1)
+
+    return uv_grid
+
+
+def position_grid_to_embed(pos_grid: torch.Tensor, embed_dim: int, omega_0: float = 100) -> torch.Tensor:
+    """
+    Convert 2D position grid (HxWx2) to sinusoidal embeddings (HxWxC)
+
+    Args:
+        pos_grid: Tensor of shape (H, W, 2) containing 2D coordinates
+        embed_dim: Output channel dimension for embeddings
+
+    Returns:
+        Tensor of shape (H, W, embed_dim) with positional embeddings
+    """
+    H, W, grid_dim = pos_grid.shape
+    assert grid_dim == 2
+    pos_flat = pos_grid.reshape(-1, grid_dim)  # Flatten to (H*W, 2)
+
+    # Process x and y coordinates separately
+    emb_x = make_sincos_pos_embed(embed_dim // 2, pos_flat[:, 0], omega_0=omega_0)  # [1, H*W, D/2]
+    emb_y = make_sincos_pos_embed(embed_dim // 2, pos_flat[:, 1], omega_0=omega_0)  # [1, H*W, D/2]
+
+    # Combine and reshape
+    emb = torch.cat([emb_x, emb_y], dim=-1)  # [1, H*W, D]
+
+    return emb.reshape(H, W, embed_dim)  # [H, W, D]
+
+
+def activate_head(out, activation="norm_exp", conf_activation="expp1"):
+    """
+    Process network output to extract 3D points and confidence values.
+
+    Args:
+        out: Network output tensor (B, C, H, W)
+        activation: Activation type for 3D points
+        conf_activation: Activation type for confidence values
+
+    Returns:
+        Tuple of (3D points tensor, confidence tensor)
+    """
+    # Move channels from last dim to the 4th dimension => (B, H, W, C)
+    fmap = out.permute(0, 2, 3, 1)  # B,H,W,C expected
+
+    # Split into xyz (first C-1 channels) and confidence (last channel)
+    xyz = fmap[:, :, :, :-1]
+    conf = fmap[:, :, :, -1]
+
+    if activation == "norm_exp":
+        d = xyz.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        xyz_normed = xyz / d
+        pts3d = xyz_normed * torch.expm1(d)
+    elif activation == "norm":
+        pts3d = xyz / xyz.norm(dim=-1, keepdim=True)
+    elif activation == "exp":
+        pts3d = torch.exp(xyz)
+    elif activation == "relu":
+        pts3d = F.relu(xyz)
+    elif activation == "inv_log":
+        pts3d = inverse_log_transform(xyz)
+    elif activation == "xy_inv_log":
+        xy, z = xyz.split([2, 1], dim=-1)
+        z = inverse_log_transform(z)
+        pts3d = torch.cat([xy * z, z], dim=-1)
+    elif activation == "sigmoid":
+        pts3d = torch.sigmoid(xyz)
+    elif activation == "linear":
+        pts3d = xyz
+    else:
+        raise ValueError(f"Unknown activation: {activation}")
+
+    if conf_activation == "expp1":
+        conf_out = 1 + conf.exp()
+    elif conf_activation == "expp0":
+        conf_out = conf.exp()
+    elif conf_activation == "sigmoid":
+        conf_out = torch.sigmoid(conf)
+    else:
+        raise ValueError(f"Unknown conf_activation: {conf_activation}")
+
+    return pts3d, conf_out

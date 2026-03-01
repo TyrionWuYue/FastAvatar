@@ -7,421 +7,456 @@ This script generates dataset JSON files from raw data directories.
 import os
 import json
 import numpy as np
-import argparse
-from typing import Dict, List, Union
-from pathlib import Path
+from typing import Dict, List, Optional
+from tqdm import tqdm
 
 
-def process_root_directory(
-    root_dir: str,
-    frames_per_sample: int = 32,
-    seed: int = 42,
-    task_type: str = "monocular",
-    max_input_frames: int = 16,
-    samples_multiplier: int = 5
-) -> Dict[str, Dict[str, List[Dict[str, Union[str, int]]]]]:
+class JsonStreamWriter:
     """
-    Process the root directory and generate frame groups based on task type.
-    
-    Directory structure:
-    root_dir/
-        sequence_task_part-x/
-            person_id/
-                cam_id/
-                    processed_data/
-                        00000/
-                            rgb.npy
-                            mask.npy
-                            intrs.npy
-                            landmark2d.npz
-                            bg_color.npy
-                        00001/
-                            ...
-    
-    Args:
-        root_dir: Root directory containing the dataset
-        frames_per_sample: Number of camera-frame pairs per sample
-        seed: Random seed for frame selection
-        task_type: Type of task - "monocular", "multi-view", or "unified"
-        max_input_frames: Maximum number of input frames (default: 16)
-    
-    Returns:
-        Dictionary containing frame groups
-        Format: {
-            "sequence_name/person_id/group_id": {
-                "data": [
-                    {"camera": "cam1", "frame": 1},
-                    {"camera": "cam1", "frame": 2},
-                    ...
-                ],
-                "input_frames": 5
-            }
-        }
+    Helper class for streaming JSON writing.
+    Writes items incrementally to a JSON object structure: 
+    {
+        "key1": value1,
+        "key2": value2,
+        ...
+    }
     """
-    np.random.seed(seed)
-    
-    if task_type not in ["monocular", "multi-view", "unified"]:
-        raise ValueError(f"Invalid task_type: {task_type}. Must be 'monocular', 'multi-view', or 'unified'")
-    
-    frame_groups: Dict[str, Dict[str, List[Dict[str, Union[str, int]]]]] = {}
-    required_files = {'rgb.npy', 'mask.npy', 'intrs.npy', 'landmark2d.npz', 'bg_color.npy'}
-    
-    print(f"Processing root directory: {root_dir}")
-    print(f"Task type: {task_type}")
-    print(f"Frames per sample: {frames_per_sample}")
-    
-    total_sequences = 0
-    total_persons = 0
-    total_monocular_groups = 0
-    total_multiview_groups = 0
-    
-    for sequence_name in sorted(os.listdir(root_dir)):
-        # Filter out sequences containing "head" in their name
-        if "head" in sequence_name.lower():
-            print(f"Skipping sequence with 'head' in name: {sequence_name}")
-            continue
-            
-        sequence_dir = os.path.join(root_dir, sequence_name)
-        if not os.path.isdir(sequence_dir):
-            continue
-            
-        total_sequences += 1
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.f = None
+        self.first_item = True
+        self.count = 0
+
+    def __enter__(self):
+        dirname = os.path.dirname(self.filename)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        self.f = open(self.filename, 'w')
+        self.f.write('{\n')
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.f:
+            self.f.write('\n}\n')
+            self.f.close()
+
+    def add_item(self, key: str, value: any):
+        """Write a single key-value pair."""
+        if not self.first_item:
+            self.f.write(',\n')
         
-        for person_id in sorted(os.listdir(sequence_dir)):
-            person_dir = os.path.join(sequence_dir, person_id)
-            if not os.path.isdir(person_dir):
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                if isinstance(obj, np.floating):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super(NumpyEncoder, self).default(obj)
+
+        json_str = json.dumps(value, cls=NumpyEncoder)
+        self.f.write(f'  "{key}": {json_str}')
+        
+        self.first_item = False
+        self.count += 1
+        
+        # Optional: Flush periodically
+        if self.count % 100 == 0:
+            self.f.flush()
+
+    def get_count(self):
+        return self.count
+
+
+def collect_valid_frames(processed_data_root: str) -> List[int]:
+    """Collect valid frame indices from processed_data directory."""
+    required_files = {'rgb.npy', 'mask.npy', 'intrs.npy', 'landmark2d.npz', 'bg_color.npy'}
+
+    try:
+        if not os.path.exists(processed_data_root):
+            return []
+            
+        all_entries = os.listdir(processed_data_root)
+        frame_dirs = [d for d in all_entries
+                    if d.isdigit() and os.path.isdir(os.path.join(processed_data_root, d))]
+        frame_dirs.sort(key=int)
+
+        required_set = set(required_files)
+        camera_frames = []
+        for d in frame_dirs:
+            frame_idx = int(d)
+            frame_path = os.path.join(processed_data_root, d)
+            try:
+                frame_files = os.listdir(frame_path)
+                if required_set.issubset(set(frame_files)):
+                    camera_frames.append(frame_idx)
+            except OSError:
                 continue
-                
-            total_persons += 1
-            
-            # Collect frames from all cameras for this person
-            person_camera_frames = {}
-            
-            for camera_id in sorted(os.listdir(person_dir)):
-                camera_dir = os.path.join(person_dir, camera_id)
-                if not os.path.isdir(camera_dir):
-                    continue
-                    
-                processed_data_root = os.path.join(camera_dir, "processed_data")
-                if not os.path.isdir(processed_data_root):
-                    continue
-                    
-                # Collect valid frames for this camera
-                camera_frames = []
-                frame_dirs = [d for d in sorted(os.listdir(processed_data_root)) 
-                            if d.isdigit() and os.path.isdir(os.path.join(processed_data_root, d))]
-                
-                for d in frame_dirs:
-                    frame_path = os.path.join(processed_data_root, d)
-                    frame_files = set(os.listdir(frame_path))
-                    if required_files.issubset(frame_files):
-                        camera_frames.append(int(d))
-                
-                if len(camera_frames) > 0:
-                    person_camera_frames[camera_id] = camera_frames
-            
-            if len(person_camera_frames) == 0:
-                continue
-            
-            # Generate groups based on task type
-            if task_type == "monocular":
-                groups = _generate_monocular_groups(person_camera_frames, frames_per_sample, max_input_frames, samples_multiplier)
-                mono_groups = groups
-                multi_groups = []
-            elif task_type == "multi-view":
-                groups = _generate_multiview_groups(person_camera_frames, frames_per_sample, max_input_frames, samples_multiplier)
-                mono_groups = []
-                multi_groups = groups
-            elif task_type == "unified":
-                mono_groups = _generate_monocular_groups(person_camera_frames, frames_per_sample, max_input_frames, samples_multiplier)
-                multi_groups = _generate_multiview_groups(person_camera_frames, frames_per_sample, max_input_frames, samples_multiplier)
-                groups = mono_groups + multi_groups
-            
-            # Add groups to frame_groups and count them
-            base_key = f"{sequence_name}/{person_id}"
-            for group_idx, group_data in enumerate(groups, 1):
-                key = f"{base_key}/{group_idx:05d}"
-                frame_groups[key] = group_data  # group_data now contains both "data" and "input_frames"
-            
-            # Update counters
-            total_monocular_groups += len(mono_groups)
-            total_multiview_groups += len(multi_groups)
-    
-    # Print results based on task type
-    if task_type == "monocular":
-        print(f"Processed {total_sequences} sequences, {total_persons} persons, generated {total_monocular_groups} monocular frame groups")
-    elif task_type == "multi-view":
-        print(f"Processed {total_sequences} sequences, {total_persons} persons, generated {total_multiview_groups} multi-view frame groups")
-    elif task_type == "unified":
-        total_groups = total_monocular_groups + total_multiview_groups
-        print(f"Processed {total_sequences} sequences, {total_persons} persons:")
-        print(f"  - Generated {total_monocular_groups} monocular frame groups")
-        print(f"  - Generated {total_multiview_groups} multi-view frame groups")
-        print(f"  - Total: {total_groups} frame groups")
-    
-    return frame_groups
+        return camera_frames
+    except OSError:
+        return []
+
+
+def _generate_groups_by_strategy(
+    person_camera_frames: Dict[str, any],
+    task_type: str,
+    max_input_frames: int = 16,
+    target_frames: int = 16,
+    rng: Optional[np.random.Generator] = None,
+    multiply: int = 1
+) -> List[Dict[str, any]]:
+    """
+    Generate groups based on dataset strategy.
+    If multiply > 1, generate multiple versions with different random seeds.
+    """
+    all_groups = []
+
+    for i in range(multiply):
+        # Create a new RNG for each multiplication iteration
+        current_seed = i if rng is None else rng.integers(0, 2**32) + i
+        current_rng = np.random.default_rng(current_seed)
+
+        if task_type == "monocular":
+            groups = _generate_monocular_groups(person_camera_frames, max_input_frames, target_frames, current_rng)
+        else:
+            # Default to multiview (mixed cameras)
+            groups = _generate_multiview_groups(person_camera_frames, max_input_frames, target_frames, current_rng)
+
+        all_groups.extend(groups)
+
+    return all_groups
+
 
 
 def _generate_monocular_groups(
-    person_camera_frames: Dict[str, List[int]], 
-    frames_per_sample: int,
+    person_camera_frames: Dict[str, any],
     max_input_frames: int = 16,
-    samples_multiplier: int = 5
-) -> List[List[Dict[str, Union[str, int]]]]:
-    """
-    Generate monocular groups: each group contains frames from the same camera.
-    
-    Args:
-        person_camera_frames: Dict mapping camera_id to list of frame indices
-        frames_per_sample: Number of frames per sample
-        max_input_frames: Maximum number of input frames
-        samples_multiplier: Multiplier for number of samples (default: 5)
-        
-    Returns:
-        List of groups, each group is a list of camera-frame pairs with input_frames info
-    """
+    target_frames: int = 16,
+    rng: Optional[np.random.Generator] = None
+) -> List[Dict[str, any]]:
+    """Generates groups for monocular data (single camera)."""
     groups = []
     
-    for camera_id, frames in person_camera_frames.items():
-        if len(frames) < frames_per_sample:
+    # In monocular mode, we expect person_camera_frames to contain ONE camera
+    if not person_camera_frames:
+        return groups
+
+    # Use provided RNG or create default
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Use the first available camera
+    camera_id = list(person_camera_frames.keys())[0]
+    camera_data = person_camera_frames[camera_id]
+
+    if isinstance(camera_data, dict):
+        frames = camera_data['frames']
+        sequence = camera_data['sequence']
+    else:
+        frames = camera_data
+        sequence = None
+
+    total_frames = len(frames)
+    if total_frames < target_frames + 1:
+        return groups
+
+    # Define input frames schedule
+    input_frame_counts = list(range(2, 16))
+    base_schedule = []
+    current = 16
+    while current <= max_input_frames:
+        base_schedule.append(current)
+        current *= 2
+    input_frames_schedule = input_frame_counts + base_schedule
+
+    # Shuffle frames to create diversity
+    shuffled_frames = list(frames)
+    rng.shuffle(shuffled_frames)
+
+    max_possible_input = total_frames - target_frames
+    valid_input_frames = [n for n in input_frames_schedule if n <= max_possible_input]
+
+    for input_frames in valid_input_frames:
+        # Strategy: Pick input_frames random inputs, and 16 random targets (but from the same set)
+        # Note: The original logic took first N as input and last M as target from the SHUFFLED list.
+        # This effectively means disjoint sets if total > input + target.
+        
+        input_frame_nums = shuffled_frames[:input_frames]
+        target_frame_nums = shuffled_frames[-target_frames:]
+
+        data = []
+        for frame in input_frame_nums + target_frame_nums:
+            data.append({
+                "camera": camera_id,
+                "frame": frame,
+                "seq": sequence
+            })
+
+        groups.append({
+            "data": data,
+            "input_frames": input_frames
+        })
+
+    return groups
+
+
+
+
+def process_dataset_monocular(
+    root_dir: str,
+    output_writer: JsonStreamWriter,
+    max_input_frames: int = 16,
+    target_frames: int = 16,
+    seed: int = 42,
+    dataset_name: str = "",
+    multiply: int = 1
+):
+    """
+    Process dataset in Monocular mode.
+    Strictly seperates sequences: person/camera/sequence is an independent unit.
+    """
+    print(f"Processing MONOCULAR mode: {root_dir} (dataset: {dataset_name})")
+    print(f"Structure expected: {root_dir}/<person>/<camera>/<sequence>/...")
+
+    if not os.path.isdir(root_dir):
+        print(f"Root dir {root_dir} does not exist.")
+        return
+
+    # List persons
+    persons = sorted([p for p in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, p))])
+    
+    # Initialize RNG once
+    rng = np.random.default_rng(seed)
+    
+    global_group_counter = 0
+
+    for person_id in tqdm(persons, desc=f"Persons ({dataset_name})"):
+        person_dir = os.path.join(root_dir, person_id)
+        
+        cameras = sorted([c for c in os.listdir(person_dir) if os.path.isdir(os.path.join(person_dir, c))])
+        for camera_id in cameras:
+            camera_dir = os.path.join(person_dir, camera_id)
+            
+            seqs = sorted([s for s in os.listdir(camera_dir) if os.path.isdir(os.path.join(camera_dir, s))])
+            for seq_name in seqs:
+                if "head" in seq_name.lower(): continue # Skip generic head meshes if any
+                
+                seq_dir = os.path.join(camera_dir, seq_name)
+                processed_dir = os.path.join(seq_dir, "processed_data")
+                
+                frames = collect_valid_frames(processed_dir)
+                if not frames: continue
+
+                # Prepare data structure for generator
+                person_camera_frames = {
+                    camera_id: {
+                        "frames": frames,
+                        "sequence": seq_name
+                    }
+                }
+                
+                # Generate
+                groups = _generate_groups_by_strategy(
+                    person_camera_frames,
+                    "monocular",
+                    max_input_frames,
+                    target_frames,
+                    rng,
+                    multiply
+                )
+
+                for grp in groups:
+                    global_group_counter += 1
+                    
+                    # Prefix key with dataset_name if provided
+                    unique_id = f"{person_id}/{global_group_counter:07d}"
+                    if dataset_name:
+                        output_key = f"{dataset_name}/{unique_id}"
+                    else:
+                        output_key = unique_id
+                        
+                    output_writer.add_item(output_key, grp)
+
+
+def process_dataset_unified(
+    root_dir: str,
+    output_writer: JsonStreamWriter,
+    max_input_frames: int = 16,
+    target_frames: int = 16,
+    seed: int = 42,
+    dataset_name: str = "",
+    multiply: int = 1
+):
+    """
+    Process dataset in Unified mode.
+    Aggregates ALL cameras and sequences for a single Person.
+    """
+    print(f"Processing UNIFIED mode: {root_dir} (dataset: {dataset_name})")
+    
+    if not os.path.isdir(root_dir):
+        return
+
+    persons = sorted([p for p in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, p))])
+
+    # Initialize RNG once
+    rng = np.random.default_rng(seed)
+
+    for person_id in tqdm(persons, desc=f"Persons ({dataset_name})"):
+        person_dir = os.path.join(root_dir, person_id)
+        
+        # Collect ALL frames for this person
+        person_camera_frames = {} 
+        
+        cameras = sorted([c for c in os.listdir(person_dir) if os.path.isdir(os.path.join(person_dir, c))])
+        for camera_id in cameras:
+            camera_dir = os.path.join(person_dir, camera_id)
+            seqs = sorted([s for s in os.listdir(camera_dir) if os.path.isdir(os.path.join(camera_dir, s))])
+            
+            for seq_name in seqs:
+                if "head" in seq_name.lower(): continue
+                
+                seq_dir = os.path.join(camera_dir, seq_name)
+                processed_dir = os.path.join(seq_dir, "processed_data")
+                frames = collect_valid_frames(processed_dir)
+                if not frames: continue
+                
+                # Create a unique key for this batch of frames so they accumulate
+                unique_key = f"{camera_id}::{seq_name}"
+                person_camera_frames[unique_key] = {
+                    "frames": frames,
+                    "sequence": seq_name,
+                }
+        
+        if not person_camera_frames:
             continue
-            
-        # Generate groups by sampling frames from this camera
-        frames_array = np.array(frames)
-        num_groups = len(frames_array) // frames_per_sample
+
+        groups = _generate_groups_by_strategy(
+            person_camera_frames,
+            "multi-view",
+            max_input_frames,
+            target_frames,
+            rng,
+            multiply
+        )
         
-        # Multiply the number of groups by samples_multiplier
-        total_samples = num_groups * samples_multiplier
-        
-        for _ in range(total_samples):
-            # Sample frames_per_sample frames without replacement
-            selected_indices = np.random.choice(
-                len(frames_array), 
-                size=frames_per_sample, 
-                replace=False
-            )
-            selected_frames = frames_array[selected_indices]
+        for grp in groups:
+            # Prefix key with dataset_name if provided
+            unique_id = f"{person_id}/{output_writer.get_count() + 1:07d}"
+            if dataset_name:
+                output_key = f"{dataset_name}/{unique_id}"
+            else:
+                output_key = unique_id
+                
+            output_writer.add_item(output_key, grp)
+
+        # Also generate monocular samples for each camera-sequence pair
+        for unique_key, data in person_camera_frames.items():
+            if "::" in unique_key:
+                real_cam_id = unique_key.split("::")[0]
+            else:
+                real_cam_id = unique_key
             
-            # Randomly determine input_frames for this group (2 to max_input_frames)
-            input_frames = np.random.randint(2, max_input_frames + 1)
-            
-            # Create camera-frame pairs with input_frames info
-            group_data = []
-            for frame in selected_frames:
-                group_data.append({"camera": camera_id, "frame": int(frame)})
-            
-            # Add input_frames to the group metadata
-            group_with_metadata = {
-                "data": group_data,
-                "input_frames": input_frames
+            # Construct single camera dict
+            single_cam_data = {
+                real_cam_id: data
             }
             
-            groups.append(group_with_metadata)
-    
-    return groups
+            mono_groups = _generate_groups_by_strategy(
+                single_cam_data,
+                "monocular",
+                max_input_frames,
+                target_frames,
+                rng,
+                multiply
+            )
+            
+            for grp in mono_groups:
+                # Prefix key with dataset_name if provided
+                unique_id = f"{person_id}/{output_writer.get_count() + 1:07d}"
+                if dataset_name:
+                    output_key = f"{dataset_name}/{unique_id}"
+                else:
+                    output_key = unique_id
+                    
+                output_writer.add_item(output_key, grp)
 
 
+# Re-implementing _generate_multiview_groups to handle the key issue
 def _generate_multiview_groups(
-    person_camera_frames: Dict[str, List[int]], 
-    frames_per_sample: int,
+    person_camera_frames: Dict[str, any],
     max_input_frames: int = 16,
-    samples_multiplier: int = 5
-) -> List[List[Dict[str, Union[str, int]]]]:
-    """
-    Generate multi-view groups: each group contains frames from different cameras.
-    
-    Args:
-        person_camera_frames: Dict mapping camera_id to list of frame indices
-        frames_per_sample: Number of camera-frame pairs per sample
-        max_input_frames: Maximum number of input frames
-        samples_multiplier: Multiplier for number of samples (default: 5)
-        
-    Returns:
-        List of groups, each group is a list of camera-frame pairs with input_frames info
-    """
+    target_frames: int = 16,
+    rng: Optional[np.random.Generator] = None
+) -> List[Dict[str, any]]:
+    """Generates groups for multi-view data (mixing cameras/sequences)."""
     groups = []
-    
-    # Create all possible camera-frame pairs
-    camera_frame_pairs = []
-    for camera_id, frames in person_camera_frames.items():
-        for frame in frames:
-            camera_frame_pairs.append({"camera": camera_id, "frame": frame})
-    
-    if len(camera_frame_pairs) < frames_per_sample:
-        return groups
-    
-    # Generate groups by sampling camera-frame pairs
-    camera_frame_pairs = np.array(camera_frame_pairs)
-    num_groups = len(camera_frame_pairs) // frames_per_sample
-    
-    # Multiply the number of groups by samples_multiplier
-    total_samples = num_groups * samples_multiplier
-    
-    for _ in range(total_samples):
-        # Sample frames_per_sample pairs without replacement
-        selected_indices = np.random.choice(
-            len(camera_frame_pairs), 
-            size=frames_per_sample, 
-            replace=False
-        )
-        selected_pairs = camera_frame_pairs[selected_indices].tolist()
-        
-        # Randomly determine input_frames for this group (2 to max_input_frames)
-        input_frames = np.random.randint(2, max_input_frames + 1)
-        
-        # Add input_frames to the group metadata
-        group_with_metadata = {
-            "data": selected_pairs,
-            "input_frames": input_frames
-        }
-        
-        groups.append(group_with_metadata)
-    
-    return groups
+    if rng is None:
+        rng = np.random.default_rng()
 
-
-def save_frame_groups(frame_groups: Dict[str, Dict[str, List[Dict[str, Union[str, int]]]]], 
-                     meta_path: str, task_type: str = "monocular") -> None:
-    """
-    Save multi-view frame groups to JSON file.
-    
-    Args:
-        frame_groups: Dictionary containing multi-view frame groups
-        meta_path: Path to save the JSON file
-        task_type: Type of task for display purposes
-    """
-    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
-    
-    with open(meta_path, 'w') as f:
-        f.write('{\n')
-        sorted_items = sorted(frame_groups.items())
-        for i, (key, data) in enumerate(sorted_items):
-            # Format data array
-            data_parts = []
-            for item in data['data']:
-                camera = item['camera']
-                frame = item['frame']
-                data_parts.append(f'{{"camera":"{camera}","frame":{frame}}}')
-            
-            data_str = '[' + ','.join(data_parts) + ']'
-            
-            # Add input_frames if it exists
-            if 'input_frames' in data:
-                input_frames = data['input_frames']
-                full_data_str = f'{{"data":{data_str},"input_frames":{input_frames}}}'
+    # Collect ALL frames from ALL cameras/sequences
+    all_pairs = []
+    for key, data in person_camera_frames.items():
+        if isinstance(data, dict):
+            frames = data['frames']
+            seq = data['sequence']
+            # Parsing real camera ID if encoded in key "cam::seq"
+            if "::" in key:
+                real_cam = key.split("::")[0]
             else:
-                full_data_str = f'{{"data":{data_str}}}'
+                real_cam = key
             
-            f.write(f'    "{key}": {full_data_str}')
-            if i < len(sorted_items) - 1:
-                f.write(',')
-            f.write('\n')
-        f.write('}\n')
+            for f in frames:
+                all_pairs.append({"camera": real_cam, "frame": f, "seq": seq})
+        else:
+            # Fallback
+            for f in data:
+                all_pairs.append({"camera": key, "frame": f})
+
+    total_frames = len(all_pairs)
+    if total_frames < target_frames + 1:
+        return groups
+
+    # Input schedule
+    input_frame_counts = list(range(2, 16))
+    base_schedule = []
+    current = 16
+    while current <= max_input_frames:
+        base_schedule.append(current)
+        current *= 2
+    input_frames_schedule = input_frame_counts + base_schedule
+
+    # Chunking strategy
+    max_sched_input = max(input_frames_schedule) if input_frames_schedule else 16
+    ideal_chunk_size = max_sched_input + target_frames
     
-    # Display appropriate message based on task type
-    if task_type == "monocular":
-        print(f"Saved {len(frame_groups)} monocular frame groups to {meta_path}")
-    elif task_type == "multi-view":
-        print(f"Saved {len(frame_groups)} multi-view frame groups to {meta_path}")
-    elif task_type == "unified":
-        print(f"Saved {len(frame_groups)} unified frame groups to {meta_path}")
+    if total_frames < ideal_chunk_size:
+        available_input = total_frames - target_frames
+        if available_input <= 0: return groups
+        chunk_size = available_input + target_frames
     else:
-        print(f"Saved {len(frame_groups)} frame groups to {meta_path}")
+        chunk_size = ideal_chunk_size
 
+    num_chunks = max(1, total_frames // chunk_size)
+    rng.shuffle(all_pairs)
 
-def generate_dataset_json(
-    root_dir: str,
-    meta_path: str,
-    frames_per_sample: int = 32,
-    seed: int = 42,
-    task_type: str = "monocular",
-    max_input_frames: int = 16,
-    samples_multiplier: int = 5,
-    force_regenerate: bool = False
-) -> bool:
-    """
-    Generate dataset JSON file from root directory.
-    
-    Args:
-        root_dir: Root directory containing the dataset
-        meta_path: Path to save the JSON file
-        frames_per_sample: Number of frames per sample
-        seed: Random seed for frame selection
-        task_type: Type of task - "monocular", "multi-view", or "unified"
-        max_input_frames: Maximum number of input frames (default: 16)
-        force_regenerate: Force regeneration even if file exists
-    
-    Returns:
-        True if file was generated or already exists, False otherwise
-    """
-    # Check if meta file exists and is not empty
-    if not force_regenerate and os.path.exists(meta_path):
-        try:
-            with open(meta_path, 'r') as f:
-                frame_groups = json.load(f)
-                if len(frame_groups) > 0:
-                    print(f"Dataset JSON file already exists at {meta_path} ({len(frame_groups)} groups)")
-                    return True
-        except json.JSONDecodeError:
-            print(f"Warning: {meta_path} is not a valid JSON file. Will regenerate.")
-    
-    # Generate meta file
-    print(f"Generating dataset JSON file at {meta_path}")
-    frame_groups = process_root_directory(root_dir, frames_per_sample, seed, task_type, max_input_frames, samples_multiplier)
-    
-    if len(frame_groups) == 0:
-        print("No valid frame groups found!")
-        return False
-    
-    save_frame_groups(frame_groups, meta_path, task_type)
-    return True
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * chunk_size
+        end = start + chunk_size
+        chunk_data = all_pairs[start:end]
+        
+        available = len(chunk_data)
+        current_max_input = available - target_frames
+        if current_max_input <= 0: continue
+        
+        valid_input_counts = [n for n in input_frames_schedule if n <= current_max_input]
+        
+        for cnt in valid_input_counts:
+            inputs = chunk_data[:cnt]
+            targets = chunk_data[-target_frames:]
+            groups.append({
+                "data": inputs + targets,
+                "input_frames": cnt
+            })
 
-
-def main():
-    parser = argparse.ArgumentParser(description='Generate dataset JSON file for VGGTAvatar')
-    parser.add_argument('--root_dir', type=str, default="/Data/wuyue/nersemble_FLAME",
-                       help='Root directory containing the dataset (default: /Data/wuyue/nersemble_FLAME)')
-    parser.add_argument('--meta_path', type=str, default="./datasets/nersemble_uids.json",
-                       help='Path to save the JSON file (default: ./datasets/nersemble_uids.json)')
-    parser.add_argument('--frames_per_sample', type=int, default=32,
-                       help='Number of frames per sample (default: 32)')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed for frame selection (default: 42)')
-    parser.add_argument('--task_type', type=str, default="monocular",
-                       choices=["monocular", "multi-view", "unified"],
-                       help='Task type: monocular, multi-view, or unified (default: monocular)')
-    parser.add_argument('--max_input_frames', type=int, default=16,
-                       help='Maximum number of input frames (default: 16)')
-    parser.add_argument('--samples_multiplier', type=int, default=5,
-                       help='Multiplier for number of samples (default: 5)')
-    parser.add_argument('--force', action='store_true',
-                       help='Force regeneration even if file exists')
-    
-    args = parser.parse_args()
-    
-    # Validate inputs
-    if not os.path.exists(args.root_dir):
-        print(f"Error: Root directory {args.root_dir} does not exist!")
-        return 1
-    
-    if args.frames_per_sample <= 0:
-        print(f"Error: frames_per_sample must be positive, got {args.frames_per_sample}")
-        return 1
-    
-    # Generate dataset JSON
-    success = generate_dataset_json(
-        root_dir=args.root_dir,
-        meta_path=args.meta_path,
-        frames_per_sample=args.frames_per_sample,
-        seed=args.seed,
-        task_type=args.task_type,
-        max_input_frames=args.max_input_frames,
-        samples_multiplier=args.samples_multiplier,
-        force_regenerate=args.force
-    )
-    
-    return 0 if success else 1
-
-
-if __name__ == "__main__":
-    exit(main()) 
+    return groups

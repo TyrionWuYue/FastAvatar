@@ -103,7 +103,7 @@ class FrameBaseDataset(torch.utils.data.Dataset, ABC):
         self.meta_path = meta_path
         self.input_frames = input_frames
         self.frames_per_sample = frames_per_sample
-        self.uids = self._load_uids(self)
+        self.uids = self._load_uids()
 
         assert self.frames_per_sample > self.input_frames, "frames_per_sample must be greater than input_frames"
     
@@ -123,31 +123,33 @@ class FrameBaseDataset(torch.utils.data.Dataset, ABC):
             # raise e
             return self.__getitem__((idx + 1) % self.__len__())
     
-    @staticmethod
     def _load_uids(self):
-        """Load UIDs from meta file.
+        """Load UIDs from meta file or from pre-filtered data dictionary.
         
         Returns:
             list: A list of UIDs, where each UID is a tuple of (sequence_path, frame_data)
                  For the new structure, frame_data is a dict with "data" key containing 
                  a list of camera-frame pairs
         """
-        # Check if meta file exists
-        if not os.path.exists(self.meta_path):
-            raise FileNotFoundError(
-                f"Meta file {self.meta_path} not found. "
-                f"Please run preprocessing first: python scripts/preprocess_before_train.py --config your_config.yaml"
-            )
-        
-        # Load frame groups from JSON file
-        with open(self.meta_path, 'r') as f:
-            try:
-                frame_groups = json.load(f)
-            except json.JSONDecodeError:
-                raise ValueError(f"Invalid JSON file: {self.meta_path}")
+        # If meta_path is already a dict (pre-filtered data from MixerDataset), use it directly
+        if isinstance(self.meta_path, dict):
+            frame_groups = self.meta_path
+        else:
+            # Load from JSON file
+            if not os.path.exists(self.meta_path):
+                raise FileNotFoundError(
+                    f"Meta file {self.meta_path} not found. "
+                    f"Please run preprocessing first: python FastAvatar/utils/preprocess_dataset.py"
+                )
+            
+            with open(self.meta_path, 'r') as f:
+                try:
+                    frame_groups = json.load(f)
+                except json.JSONDecodeError:
+                    raise ValueError(f"Invalid JSON file: {self.meta_path}")
         
         if len(frame_groups) == 0:
-            raise ValueError(f"Meta file {self.meta_path} is empty")
+            raise ValueError(f"Meta file is empty")
         
         # Convert frame_groups to uids list
         uids = []
@@ -167,7 +169,8 @@ class FrameBaseDataset(torch.utils.data.Dataset, ABC):
                     })
                 uids.append((path, converted_data))
         
-        print(f"Loaded {len(uids)} frame groups from {self.meta_path}")
+        source_info = "pre-filtered data" if isinstance(self.meta_path, dict) else self.meta_path
+        print(f"Loaded {len(uids)} frame groups from {source_info}")
         return uids
 
 
@@ -177,7 +180,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Test FrameBasedDataset')
     parser.add_argument('--root_dir', type=str, default="/mnt/Data/wuyue/nersemble_FLAME", help='Root directory containing both image and FLAME folders')
-    parser.add_argument('--meta_path', type=str, default="/home/tjwr/wuyue/Avatar/VGGTAvatar/datasets/nersemble_uids.json", help='Path to meta json file')
+    parser.add_argument('--meta_path', type=str, default="/home/tjwr/wuyue/Avatar/FastAvatar/datasets/nersemble_uids.json", help='Path to meta json file')
     parser.add_argument('--frames_per_sample', type=int, default=20, help='Number of frames per sample')
     args = parser.parse_args()
 

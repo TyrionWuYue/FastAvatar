@@ -2,3 +2,4 @@ model_zoo/
 .DS_Store
 assets/sample_input/
 assets/sample_motion/
+__pycache__/

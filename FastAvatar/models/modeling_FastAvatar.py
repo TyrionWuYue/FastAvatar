@@ -1,32 +1,16 @@
-# Copyright (c) 2024-2025, The Alibaba 3DAIGC Team Authors. 
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import os
 import time
-import math
 import logging
-from collections import defaultdict
-import numpy as np
 import torch
 import torch.nn as nn
-from einops import rearrange, repeat
+import torchvision.transforms.functional as F
+from safetensors.torch import load_file
 
 from FastAvatar.models.rendering.gs_renderer import GS3DRenderer, PointEmbed
 from FastAvatar.models.alternating_cross_attn import AlternatingCrossAttn
+from FastAvatar.models.framepack_utils import FramePackCompressor
+from FastAvatar.models.encoders.dinov2_fusion_wrapper import Dinov2FusionWrapper
 from diffusers.utils import is_torch_version
-from FastAvatar.models.heads.dpt_head import DPTHead
-from FastAvatar.models.track_head import TrackHead
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,20 +18,22 @@ logger = logging.getLogger(__name__)
 
 class ModelFastAvatar(nn.Module):
     def __init__(self,
-                 transformer_dim: int = 1024, 
+                 transformer_dim: int = 1024,
                  transformer_layers: int = 10,
                  transformer_heads: int = 16,
-                 aa_order: list = ["frame", "global"],
-                 aa_block_size: int = 1,
+                 aa_order: list = ["global", "frame"],
                  tf_grad_ckpt=True,
+                 pretrained_model_path: str = None,
+                 encoder_path: str = None,
                  encoder_grad_ckpt=True,
-                 encoder_freeze: bool = True, encoder_type: str = 'dinov2_fusion',
+                 encoder_freeze: bool = True,
+                 source_image_res: int = 512,
                  encoder_model_name: str = 'dinov2_vitl14_reg',
                  encoder_feat_dim: int = 1024,
                  pcl_dim: int=1024,
                  human_model_path="./model_zoo/human_parametric_models",
+                 renderer_freeze: bool = True,
                  flame_subdivide_num=1,
-                 flame_type="flame",
                  gs_query_dim=1024,
                  gs_use_rgb=True,
                  gs_sh=3,
@@ -56,24 +42,38 @@ class ModelFastAvatar(nn.Module):
                  gs_clip_scaling=0.01,
                  fix_opacity=False,
                  fix_rotation=False,
-                 use_flame_tokens: bool = True,
-                 flame_encoder_config: dict = None,
-                 use_camera_tokens: bool = True,
-                 camera_encoder_config: dict = None,
-                 use_multi_frame_pc: bool = True,
+                 gs_fusion: bool = True,
+                 num_base_frames: int = 16,
+                 if_framepack: bool = False,
+                 framepack_compression_level: int = 4,
+                 vggt_path: str = None,
                  **kwargs,
                  ):
         super().__init__()
         self.gradient_checkpointing = tf_grad_ckpt
         self.encoder_gradient_checkpointing = encoder_grad_ckpt
-        
         # attributes
         self.encoder_feat_dim = encoder_feat_dim
-        self.use_multi_frame_pc = use_multi_frame_pc
-        self.conf_loss_frames = kwargs.get("conf_loss_frames", 4)  # Number of frames for confidence loss
+        self.gs_fusion = gs_fusion
+        self.rendering_chunk_size_train = kwargs.get("rendering_chunk_size_train", 16)
+        self.rendering_chunk_size_infer = kwargs.get("rendering_chunk_size_infer", 128)
+        self.num_base_frames = num_base_frames
+        self.if_framepack = if_framepack
+        self.framepack_compression_level = framepack_compression_level
+        self.source_image_res = source_image_res
+
+        # FramePack compressor (only used when if_framepack=True)
+        if if_framepack:
+            self.framepack_compressor = FramePackCompressor(
+                in_channels=encoder_feat_dim,
+                inner_dim=encoder_feat_dim,
+                compression_level=framepack_compression_level
+            )
+        else:
+            self.framepack_compressor = None
 
         # image encoder
-        self.encoder = self._encoder_fn(encoder_type)(
+        self.encoder = Dinov2FusionWrapper(
             model_name=encoder_model_name,
             freeze=encoder_freeze,
             encoder_feat_dim=self.encoder_feat_dim,
@@ -82,11 +82,21 @@ class ModelFastAvatar(nn.Module):
         # learnable points embedding
         self.pcl_embed = PointEmbed(dim=pcl_dim)
 
+        # Alternating cross Attention
+        self.transformer = AlternatingCrossAttn(
+            num_layers=transformer_layers,
+            num_heads=transformer_heads,
+            inner_dim=transformer_dim,
+            cond_dim=transformer_dim,
+            gradient_checkpointing=self.gradient_checkpointing,
+            aa_order=aa_order,
+            patch_start_idx=0,
+            if_framepack=if_framepack,
+        )
+
         # renderer
-        self.num_sliced_frames = kwargs.get("num_sliced_frames", 2)
         self.renderer = GS3DRenderer(human_model_path=human_model_path,
                                      subdivide_num=flame_subdivide_num,
-                                     smpl_type=flame_type,
                                      feat_dim=transformer_dim,
                                      query_dim=gs_query_dim,
                                      use_rgb=gs_use_rgb,
@@ -100,74 +110,59 @@ class ModelFastAvatar(nn.Module):
                                      skip_decoder=True,
                                      decode_with_extra_info=kwargs.get("decode_with_extra_info", None),
                                      gradient_checkpointing=self.gradient_checkpointing,
-                                     add_teeth=kwargs.get("add_teeth", False),
+                                     add_teeth=kwargs.get("add_teeth", True),
                                      teeth_bs_flag=kwargs.get("teeth_bs_flag", False),
-                                     oral_mesh_flag=kwargs.get("oral_mesh_flag", False),
+                                     oral_mesh_flag=kwargs.get("oral_mesh_flag", True),
                                      use_mesh_shading=kwargs.get('use_mesh_shading', False),
                                      render_rgb=kwargs.get("render_rgb", True),
+                                     gs_pruning=kwargs.get("gs_pruning", False),
                                      )
+
+        # Load pretrained model if available
+        if pretrained_model_path and os.path.exists(pretrained_model_path):
+            logger.info(f"Loading pretrained model from {pretrained_model_path}")
+            state_dict = load_file(pretrained_model_path)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            if missing:
+                logger.info(f"Missing keys ({len(missing)}): {missing[:10]}{'...' if len(missing) > 10 else ''}")
+            if unexpected:
+                logger.info(f"Unexpected keys ({len(unexpected)}): {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+            logger.info(f"Pretrained model loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        elif encoder_path and os.path.exists(encoder_path):
+            # Training from scratch: load DINOv2 encoder weights
+            logger.info(f"Training from scratch: loading encoder weights from {encoder_path}")
+            encoder_state_dict = load_file(encoder_path) if encoder_path.endswith('.safetensors') else torch.load(encoder_path, map_location='cpu')
+            encoder_dict = {k.replace('encoder.model.', '').replace('model.', ''): v for k, v in encoder_state_dict.items() if 'fusion_head' not in k}
+            self.encoder.model.load_state_dict(encoder_dict, strict=False)
+            logger.info("Encoder weights loaded for training from scratch")
+
+        # Set parameter requires_grad
+        for name, param in self.renderer.named_parameters():
+            if name.startswith('flame_model.'):
+                param.requires_grad = False
+            elif name.startswith('mlp_net.') or name.startswith('gs_net.'):
+                param.requires_grad = not renderer_freeze
+            else:
+                param.requires_grad = False
         
-        self.patch_start_idx = 0
-        if use_flame_tokens:
-            self.patch_start_idx += 1
-        if use_camera_tokens:
-            self.patch_start_idx += 1
-
-        # Initialize transformer parameters
-        self.intermediate_layer_idx = kwargs.get("intermediate_layer_idx", [2,5,8])
-
-        self.transformer = AlternatingCrossAttn(
-            num_layers=transformer_layers,
-            num_heads=transformer_heads,
-            inner_dim=transformer_dim,
-            cond_dim=transformer_dim,
-            gradient_checkpointing=self.gradient_checkpointing,
-            aa_order=aa_order,
-            aa_block_size=aa_block_size,
-            intermediate_layer_idx=self.intermediate_layer_idx,
-            use_flame_tokens=use_flame_tokens,
-            flame_encoder_config=flame_encoder_config,
-            use_camera_tokens=use_camera_tokens,
-            camera_encoder_config=camera_encoder_config,
-            patch_start_idx=self.patch_start_idx
-        )
-        
-        # Track Head
-        self.use_tracking = kwargs.get("use_tracking", True)
-        self.use_confidence = kwargs.get("use_confidence", True)
-        
-        if self.use_tracking:
-            self.track_head = TrackHead(
-                dim_in = transformer_dim * 2, 
-                intermediate_layer_idx=self.intermediate_layer_idx,
-                use_flame_tokens=use_flame_tokens
-            )
-        else:
-            self.track_head = None
-            logger.info("Tracking head disabled")
-
-        # confidence head
-        if self.use_confidence:
-            self.confidence_head = DPTHead(dim_in=transformer_dim*2, output_dim=1, activation='inv_log', conf_activation='expp1')
-        else:
-            self.confidence_head = None
-            logger.info("Confidence head disabled")
-
-    @staticmethod
-    def _encoder_fn(encoder_type: str):
-        from FastAvatar.models.encoders.dinov2_fusion_wrapper import Dinov2FusionWrapper
-        return Dinov2FusionWrapper
 
     def forward_encode_image(self, image):
         """
         Encode image features, supporting both single and multi-frame inputs
         Args:
-            image: [B*N_frames, C_img, H_img, W_img]
+            image: [B, N_frames, C_img, H_img, W_img]
         Returns:
-            image_feats: [B*N_frames, H*W, C]
+            image_feats: [B, N_output, H*W, C] - Base frames features
+            compressed_cond: [B, 1, compressed_tokens, C] or None - Compressed frame features (if framepack enabled)
+            base_indices: list or None - Indices of base frames in original input (if framepack enabled)
+            spatial_compression: int or None - Spatial compression ratio used (if framepack enabled)
         """
         B, N_frames, C_img, H_img, W_img = image.shape
         image = image.view(B * N_frames, C_img, H_img, W_img)
+
+        tgt_size = (self.source_image_res // 14) * 14
+        if H_img != tgt_size or W_img != tgt_size:
+            image = F.resize(image, (tgt_size, tgt_size), antialias=True)
         if self.training and self.encoder_gradient_checkpointing:
             def create_custom_forward(module):
                 def custom_forward(*inputs):
@@ -181,72 +176,99 @@ class ModelFastAvatar(nn.Module):
             )
         else:
             image_feats = self.encoder(image)
-        return image_feats
-    
-    def forward_transformer(self, image_feats, camera_embeddings, query_points, query_feats=None, flame_params=None, camera_params=None):
+        
+        # image_feats: [B*N_frames, H*W, C]
+        _, HW, C = image_feats.shape
+        
+        # Unified FramePack processing: Always provide compression for all frame counts
+        if self.if_framepack:
+            image_feats = image_feats.view(B, N_frames, HW, C)
+
+            # Always use first min(N_frames, num_base_frames) as base frames
+            actual_base_frames = min(N_frames, self.num_base_frames)
+            base_image_feats = image_feats[:, :actual_base_frames]
+            base_indices = list(range(actual_base_frames))
+
+            # Prepare 3D features for compression
+            H_feat = int(HW ** 0.5)
+            image_feats_3d = image_feats.view(B, N_frames, H_feat, H_feat, C)
+
+            if N_frames > self.num_base_frames:
+                compressed_input_3d = image_feats_3d[:, actual_base_frames:]
+            else:
+                compressed_input_3d = image_feats_3d
+
+            compressed_features, spatial_compression = self.framepack_compressor(compressed_input_3d)
+
+            compressed_cond = compressed_features.reshape(B, 1, -1, C)
+
+            return base_image_feats, compressed_cond, base_indices, spatial_compression
+        else:
+            # No FramePack: simply slice all inputs to num_base_frames
+            image_feats = image_feats.view(B, N_frames, HW, C)
+            image_feats = image_feats[:, :self.num_base_frames]
+
+            return image_feats, None, None, None
+
+    def forward_transformer(self, image_feats, query_points, query_feats=None, compressed_cond=None, spatial_compression=None):
         """
         Args:
             image_feats: [B, N_input, H*W, C]
-            query_points: [B, N_points, 3]
-            flame_params: Dictionary containing FLAME parameters for encoding into tokens
-            camera_params: Dictionary containing camera parameters for encoding into tokens
+            query_points: [B, N_input, N_points, 3]
+            query_feats: Optional query features
+            compressed_cond: [B, 1, compressed_tokens, C] or None - Compressed frame features (if framepack enabled)
+            spatial_compression: int or None - Spatial compression ratio used (if framepack enabled)
         Returns:
             latent_points: [B, N_input, N_points, C]
-            intermediate_outputs: List of intermediate layer outputs
         """
         B, N_input = image_feats.shape[:2]
-        B2 = query_points.shape[0]
-        assert B == B2, "Batch size must match"
 
         # Reshape query_points for pcl_embed
-        query_points_reshape = query_points.reshape(B, -1, 3)  # [B*N_input, N_points, 3]
-        x = self.pcl_embed(query_points_reshape)  # [B*N_input, N_points, C]
-        x = x.reshape(B, N_input, -1, x.shape[-1])  # [B, N_input, N_points, C]
-        x = x.to(image_feats.dtype)
+        x = self.pcl_embed(query_points.reshape(B, -1, 3))
+        x = x.reshape(B, query_points.shape[1], query_points.shape[2], x.shape[-1])
         if query_feats is not None:
             x = x + query_feats.to(image_feats.dtype)
-        
-        x, cond, intermediate_outputs = self.transformer(x, image_feats, mod=camera_embeddings, flame_params=flame_params, camera_params=camera_params)
-        
-        return x, cond, intermediate_outputs
+
+        # Prepare compressed frame query points if exists
+        compressed_x = x[:, N_input:N_input+1] if compressed_cond is not None else None
+        if compressed_x is not None:
+            x = x[:, :N_input]
+
+        return self.transformer(x, image_feats, compressed_x=compressed_x, compressed_cond=compressed_cond, spatial_compression=spatial_compression)
 
     @torch.compile
-    def forward_latent_points(self, image, query_points=None, flame_params=None, camera_params=None):
-        """
-        Process image and query points to get latent features
-        Args:
-            image: [B, N_input, C_img, H_img, W_img] - N_input: Output frame number
-            query_points: [B, N_points, 3]
-            flame_params: Dictionary containing FLAME parameters for encoding into tokens
-            camera_params: Dictionary containing camera parameters for encoding into tokens
-        Returns:
-            points_embedding: [B, N_inf, N_points, C]
-            image_feats: [B, N_input, H*W, C]
-            intermediate_outputs: List of intermediate layer outputs
-        """
+    def forward_latent_points(self, image, input_flame_params):
+
         B, N_input = image.shape[:2]
-        B2, N_input2 = query_points.shape[:2]
-        assert B == B2, "Batch size must match"
-        assert N_input == N_input2, "Number of Frames must match"
+        base_frames = min(self.num_base_frames, N_input)
+
+        # Encode ALL frames + FramePack (compress non-base frames when if_framepack=True)
+        base_feats, compressed_cond, _, spatial_compression = self.forward_encode_image(image)
+
+        flame_for_query = input_flame_params.copy()
+        if 'betas' not in flame_for_query and 'shape' in flame_for_query:
+            flame_for_query['betas'] = flame_for_query['shape']
+        query_points, _ = self.renderer.get_query_points(flame_for_query, device=image.device)
+
+        # Prepare query points for transformer (base_frames + 1 compressed if exists)
+        query_points_transformer = query_points[:, 0:1].repeat(1, base_frames, 1, 1)
+        if compressed_cond is not None:
+            query_points_transformer = torch.cat([query_points_transformer, query_points_transformer[:, 0:1]], dim=1)
+
+        # Reconstruction Transformer
+        latent_points = self.forward_transformer(
+            base_feats,
+            query_points_transformer,
+            compressed_cond=compressed_cond,
+            spatial_compression=spatial_compression
+        )
         
-        # encode image
-        image_feats = self.forward_encode_image(image)
-        
-        assert image_feats.shape[-1] == self.encoder_feat_dim, \
-            f"Feature dimension mismatch: {image_feats.shape[-1]} vs {self.encoder_feat_dim}"
+        return latent_points, query_points_transformer
 
-        # Convert query_points to the same dtype as image_feats
-        query_points = query_points.to(image_feats.dtype)
-        image_feats = image_feats.view(B, N_input, *image_feats.shape[1:])
-        # Get transformer output
-        latent_points, cond, intermediate_outputs = self.forward_transformer(image_feats, camera_embeddings=None, query_points=query_points, flame_params=flame_params, camera_params=camera_params)
-
-        return latent_points, intermediate_outputs
-
-    def _render_multiple_frames(self, latent_points, query_points, inf_flame_params, c2ws, intrs, bg_colors, render_h, render_w, N_inf, input_indices=[0]):
+    def _render_multiple_frames(self, latent_points, query_points, inf_flame_params, c2ws, intrs, bg_colors, render_h, render_w, N_inf, chunk_size=16, input_indices=[0]):
         """
-        Render multiple frames using the same latent points and query points.
-        
+        Render multiple frames using the same latent points and query points with chunked rendering.
+
         Args:
             latent_points: [B, N_points, C] - Latent features for 3DGS
             query_points: [B, N_points, 3] - 3D query points
@@ -256,6 +278,7 @@ class ModelFastAvatar(nn.Module):
             bg_colors: [B, N_inf, 3] - Background colors
             render_h, render_w: int - Render resolution
             N_inf: int - Number of frames to render
+            chunk_size: int - Number of frames to render per chunk. If >= N_inf, render all frames at once
 
             rotation: [B, N_inf, 3] - Rotation parameters
             translation: [B, N_inf, 3] - Translation parameters
@@ -263,142 +286,181 @@ class ModelFastAvatar(nn.Module):
             neck_pose: [B, N_inf, 3] - Neck pose parameters
             jaw_pose: [B, N_inf, 3] - Jaw pose parameters
             eyes_pose: [B, N_inf, 3] - Eyes pose parameters
-            
+
         Returns:
             Dict containing concatenated render results for all frames
         """
+        # Calculate number of chunks
+        if chunk_size >= N_inf:
+            # Render all frames at once
+            chunk_size = N_inf
+        num_chunks = (N_inf + chunk_size - 1) // chunk_size
+
         render_res_list = []
         try:
-            for f in range(N_inf):
-                # Get frame-specific parameters
-                frame_flame_params = {}
+            for chunk_idx in range(num_chunks):
+                # Calculate frame indices for this chunk
+                start_frame = chunk_idx * chunk_size
+                end_frame = min((chunk_idx + 1) * chunk_size, N_inf)
+
+                # Extract chunk-specific parameters
+                chunk_flame_params = {}
                 for k, v in inf_flame_params.items():
                     if isinstance(v, torch.Tensor):
-                        frame_flame_params[k] = v[:, f:f+1]
+                        if k == "betas":
+                            chunk_flame_params[k] = v[:, 0:1]  # [B, 1, ...]
+                        else:
+                            chunk_flame_params[k] = v[:, start_frame:end_frame]
                     else:
-                        frame_flame_params[k] = v
+                        chunk_flame_params[k] = v
 
                 # Convert all inputs to float32 for rasterization
                 latent_points_f32 = latent_points.float()
                 query_points_f32 = query_points.float()
-                frame_c2ws = c2ws[:, f:f+1].float()
-                frame_intrs = intrs[:, f:f+1].float()
-                frame_bg_colors = bg_colors[:, f:f+1].float()
-                frame_flame_params = {k: v.float() if isinstance(v, torch.Tensor) else v 
-                                    for k, v in frame_flame_params.items()}
+                chunk_c2ws = c2ws[:, start_frame:end_frame].float()
+                chunk_intrs = intrs[:, start_frame:end_frame].float()
+                chunk_bg_colors = bg_colors[:, start_frame:end_frame].float()
+                chunk_flame_params = {k: v.float() if isinstance(v, torch.Tensor) else v
+                                    for k, v in chunk_flame_params.items()}
 
-                # Render this frame
+                # Render this chunk
                 render_res = self.renderer(
                     gs_hidden_features=latent_points_f32,
                     query_points=query_points_f32,
-                    flame_data=frame_flame_params,
-                    c2w=frame_c2ws,
-                    intrinsic=frame_intrs,
+                    flame_data=chunk_flame_params,
+                    c2w=chunk_c2ws,
+                    intrinsic=chunk_intrs,
                     height=render_h,
                     width=render_w,
-                    background_color=frame_bg_colors,
+                    background_color=chunk_bg_colors,
                     num_input_frames=len(input_indices),
                 )
                 render_res_list.append(render_res)
-                
-                # Clean up frame-specific variables
-                del render_res, frame_flame_params, latent_points_f32, query_points_f32, frame_c2ws, frame_intrs, frame_bg_colors
-                
-                # Force memory cleanup after each frame
+
+                # Clean up chunk-specific variables
+                del render_res, chunk_flame_params, latent_points_f32, query_points_f32, chunk_c2ws, chunk_intrs, chunk_bg_colors
+
+                # Force memory cleanup after each chunk
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            # Combine results from all frames
+            # Combine results from all chunks
             out = {}  # Changed from defaultdict to regular dict
             for res in render_res_list:
                 for k, v in res.items():
                     if k not in out:
                         out[k] = []
                     out[k].append(v)
-            
+
             # Process each key in the output dictionary
             for k, v in out.items():
                 if isinstance(v[0], torch.Tensor):
-                    out[k] = torch.concat(v, dim=1)
-                    if k in ["comp_rgb", "comp_mask", "comp_depth"]:
-                        out[k] = out[k].permute(0, 1, 2, 3, 4) # [B, N_inf, H, W, C]
+                    if k == "pruning_masks":
+                        out[k] = torch.concat(v, dim=0)
+                    else:  # Multi-dimensional tensors
+                        out[k] = torch.concat(v, dim=1)
+                        if k == "comp_rgb":
+                            out[k] = out[k].permute(0, 1, 2, 3, 4) # [B, N_inf, H, W, C]
+                    # Clean up the list immediately after concat to free memory
+                    del v
+                elif k == "gs_stats":
+                    out[k] = v[0] if v else None
                 else:
                     out[k] = v
-                    
-            return out
-        finally:
-            # Clean up render results to prevent memory accumulation
+
+            # Clean up render_res_list before returning
             del render_res_list
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            return out
+        finally:
+            # Additional cleanup if needed (render_res_list already cleaned in the loop)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def forward(self, input_image, target_image, input_c2ws, target_c2ws, input_intrs, target_intrs, input_bg_colors, target_bg_colors, landmarks, input_flame_params, inf_flame_params, uid):
-        """
-        Multi-frame forward pass using loop for each frame
-        Args:
-            input_image: [B, N_input, C_img, H_img, W_img]
-            target_image: [B, N_target, C_img, H_img, W_img]
-            landmarks: [B, N_input, 68, 2]
-            input_c2ws: [B, N_input, 4, 4]
-            target_c2ws: [B, N_target, 4, 4]
-            input_intrs: [B, N_input, 4, 4]
-            target_intrs: [B, N_target, 4, 4]
-            bg_colors: [B, N_target, 3]
-            inf_flame_params: Dict containing FLAME parameters for target frames (N_target)
-            input_flame_params: Dict containing FLAME parameters for input frames (N_input)
-        Returns:
-            Dict containing rendered results and intermediate features
-        """
         B, N_input = input_image.shape[:2]
-        render_h, render_w = int(input_intrs[0, 0, 1, 2] * 2), int(input_intrs[0, 0, 0, 2] * 2)
         N_target = target_image.shape[1]
-
-        query_points, _ = self.renderer.get_query_points(input_flame_params, device=input_image.device)
-        assert query_points.shape[1] == N_input, "Query points should be [B, N_input, N_points, 3]"
         
-        # Construct camera parameters dictionary for input frames
-        camera_params = {
-            'c2w': input_c2ws,
-            'intrinsic': input_intrs
-        }
+        # Obtain rendering resolution from target image to guarantee match for losses
+        render_h, render_w = target_image.shape[-2:]
         
-        # Get features for all frames
-        latent_points, intermediate_outputs = self.forward_latent_points(
-            input_image,
-            query_points=query_points,
-            flame_params=input_flame_params,
-            camera_params=camera_params,
-        )
-
-        # Track head forward pass
-        if self.use_tracking:
-            track_list, vis, track_conf = self.track_head(intermediate_outputs, images=input_image, patch_start_idx=self.patch_start_idx, query_points=landmarks[:, 0])
-        else:
-            track_list, vis, track_conf = None, None, None
-
-        # Confidence head forward pass
-        if self.use_confidence:
-            _, conf = self.confidence_head(intermediate_outputs, images=input_image, patch_start_idx=self.patch_start_idx)
-        else:
-            conf = None
+        # Forward: encoder + transformer, using GT FLAME params for query points
+        latent_points, query_points = self.forward_latent_points(input_image, input_flame_params)
         
-        # Clean up intermediate outputs immediately
-        del intermediate_outputs
+        del input_image, target_image
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Use first frame for single frame processing
-        B, N_input, N_points, C = latent_points.shape
-        single_frame_idx = 0  # Always use first frame
-        single_latent_points = latent_points[:, single_frame_idx]  # [B, N_points, C]
-        single_query_points = query_points[:, single_frame_idx]  # [B, N_points, 3]
+        # Ground Truth Camera scaling (e.g. from native to render_w)
+        gt_native_w = target_intrs[..., 0, 2:3] * 2.0
+        gt_native_h = target_intrs[..., 1, 2:3] * 2.0
+        gt_scale_w = render_w / gt_native_w.clamp(min=1.0)
+        gt_scale_h = render_h / gt_native_h.clamp(min=1.0)
+        target_intrs_scaled = target_intrs.clone()
+        target_intrs_scaled[..., 0, 0] *= gt_scale_w.squeeze(-1)
+        target_intrs_scaled[..., 1, 1] *= gt_scale_h.squeeze(-1)
+        target_intrs_scaled[..., 0, 2] *= gt_scale_w.squeeze(-1)
+        target_intrs_scaled[..., 1, 2] *= gt_scale_h.squeeze(-1)
 
-        assert len(single_latent_points.shape) == 3, "Latent points should be [B, N_points, C]"
+        # Single path: GT Camera + GT FLAME (from FLAME Tracking)
+        latent_flat = latent_points.reshape(B, -1, latent_points.shape[-1])
+        query_flat = query_points.detach().reshape(B, -1, 3)
+        render_kwargs = dict(
+            render_h=render_h, render_w=render_w,
+            N_inf=N_target,
+            chunk_size=self.rendering_chunk_size_train,
+            input_indices=list(range(latent_points.shape[1]))
+        )
 
-        # Single Frame Latent Points 
         out = self._render_multiple_frames(
-            latent_points=single_latent_points,
-            query_points=single_query_points,
+            latent_points=latent_flat,
+            query_points=query_flat,
+            inf_flame_params=inf_flame_params,
+            c2ws=target_c2ws,
+            intrs=target_intrs_scaled,
+            bg_colors=target_bg_colors,
+            **render_kwargs
+        )
+        out['comp_rgb_gt_pose'] = out['comp_rgb']
+        out['comp_rgb_pred_pose'] = out['comp_rgb']
+        
+        del input_c2ws, target_c2ws, input_intrs, target_intrs, landmarks, input_flame_params, latent_flat, query_flat
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return out
+    
+    @torch.no_grad()
+    def infer_images(self, image, input_c2ws, input_intrs, target_c2ws, target_intrs, target_bg_colors, input_flame_params, inf_flame_params=None, render_h=512, render_w=512):
+        B, N_input = image.shape[:2]
+        N_target = target_c2ws.shape[1]
+        
+        modeling_time = time.time()
+        
+        latent_points, query_points = self.forward_latent_points(image, input_flame_params)
+
+        # Clean up input tensors immediately after forward_latent_points
+        del image, input_c2ws, input_intrs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        modeling_time = time.time() - modeling_time
+
+        # Use all input frames (no slicing)
+        num_input_frames = latent_points.shape[1]
+
+        # Reshape to concatenate frames along the points dimension (same as forward)
+        B, num_frames, N_points, C = latent_points.shape
+        latent_points_reshaped = latent_points.reshape(B, num_frames * N_points, C)
+        query_points_reshaped = query_points.reshape(B, num_frames * N_points, 3)
+
+        # Rendering
+        render_start = time.time()
+        out = self._render_multiple_frames(
+            latent_points=latent_points_reshaped,
+            query_points=query_points_reshaped,
             inf_flame_params=inf_flame_params,
             c2ws=target_c2ws,
             intrs=target_intrs,
@@ -406,247 +468,38 @@ class ModelFastAvatar(nn.Module):
             render_h=render_h,
             render_w=render_w,
             N_inf=N_target,
-            input_indices=[single_frame_idx]
+            chunk_size=self.rendering_chunk_size_infer,  # Use inference chunk size
+            input_indices=list(range(num_input_frames))
         )
+        render_time = time.time() - render_start
 
-        # Single frame doesn't need recon_input for confidence loss
-        out['single_recon_input_comp_rgb'] = None
-        out['single_recon_input_comp_mask'] = None
+        # # Old implementation: Render directly using renderer
+        # render_start = time.time()
+        # out = self.renderer(
+        #     gs_hidden_features=latent_points_reshaped,
+        #     query_points=query_points_reshaped,
+        #     flame_data=inf_flame_params,
+        #     c2w=target_c2ws,
+        #     intrinsic=target_intrs,
+        #     height=render_h,
+        #     width=render_w,
+        #     background_color=target_bg_colors,
+        #     num_input_frames=num_input_frames,
+        # )
+        # render_time = time.time() - render_start
 
-        if self.use_multi_frame_pc:
-            # Multi-frame point cloud processing - use first N frames
-            num_sliced_frames = min(self.num_sliced_frames, N_input)
-            sliced_frame_indices = list(range(num_sliced_frames))
-            sliced_latent_points = latent_points[:, :num_sliced_frames]  # [B, num_sliced_frames, N_points, C]
-            sliced_query_points = query_points[:, :num_sliced_frames]  # [B, num_sliced_frames, N_points, 3]
-            
-            # Reshape to concatenate frames along the points dimension
-            B_sliced, num_frames, N_points, C = sliced_latent_points.shape
-            sliced_latent_points = sliced_latent_points.reshape(B_sliced, num_frames * N_points, C)
-            sliced_query_points = sliced_query_points.reshape(B_sliced, num_frames * N_points, 3)
-            
-            assert sliced_latent_points.shape[1] == num_sliced_frames * N_points, f"Sliced latent points should be [B, num_sliced_frames*N_points, C], but got {sliced_latent_points.shape}"
-            assert sliced_query_points.shape[1] == num_sliced_frames * N_points, f"Sliced query points should be [B, num_sliced_frames*N_points, 3], but got {sliced_query_points.shape}"
-
-            multi_pc_out = self._render_multiple_frames(
-                latent_points=sliced_latent_points,
-                query_points=sliced_query_points,
-                inf_flame_params=inf_flame_params,
-                c2ws=target_c2ws,
-                intrs=target_intrs,
-                bg_colors=target_bg_colors,
-                render_h=render_h,
-                render_w=render_w,
-                N_inf=N_target,
-                input_indices=sliced_frame_indices
-            )
-
-            # Only compute recon_input if confidence is enabled
-            if self.use_confidence:
-                # Determine how many frames to use for confidence loss
-                conf_frames = min(self.conf_loss_frames, N_input)
-                
-                # Use first conf_frames for confidence loss calculation
-                conf_frame_indices = list(range(conf_frames))
-                
-                # Use first conf_frames for confidence loss calculation
-                conf_latent_points = latent_points[:, :conf_frames].reshape(B, -1, latent_points.shape[-1])
-                conf_query_points = query_points[:, :conf_frames].reshape(B, -1, query_points.shape[-1])
-                
-                # Slice input parameters to match conf_frames
-                conf_input_flame_params = {}
-                for k, v in input_flame_params.items():
-                    if isinstance(v, torch.Tensor):
-                        conf_input_flame_params[k] = v[:, :conf_frames]
-                    else:
-                        conf_input_flame_params[k] = v
-                
-                recon_input_out = self._render_multiple_frames(
-                    latent_points=conf_latent_points,
-                    query_points=conf_query_points,
-                    inf_flame_params=conf_input_flame_params,
-                    c2ws=input_c2ws[:, conf_frame_indices],
-                    intrs=input_intrs[:, conf_frame_indices],
-                    bg_colors=input_bg_colors[:, conf_frame_indices],
-                    render_h=render_h,
-                    render_w=render_w,
-                    N_inf=conf_frames,
-                    input_indices=conf_frame_indices
-                )
-
-                out['sliced_comp_rgb'] = multi_pc_out['comp_rgb']
-                out['sliced_comp_mask'] = multi_pc_out['comp_mask']
-                out['recon_input_comp_rgb'] = recon_input_out['comp_rgb']
-                out['recon_input_comp_mask'] = recon_input_out['comp_mask']
-                out['conf_frame_indices'] = conf_frame_indices
-                
-                # Clean up multi-frame variables immediately
-                del multi_pc_out, recon_input_out
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                out['sliced_comp_rgb'] = multi_pc_out['comp_rgb']
-                out['sliced_comp_mask'] = multi_pc_out['comp_mask']
-                out['recon_input_comp_rgb'] = None
-                out['recon_input_comp_mask'] = None
-                
-                # Clean up multi-frame variables immediately
-                del multi_pc_out
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        else:
-            # Use single frame for all outputs when multi-frame is disabled
-            out['sliced_comp_rgb'] = out['comp_rgb']
-            out['sliced_comp_mask'] = out['comp_mask']
-            
-            # Only compute recon_input if confidence is enabled
-            if self.use_confidence:
-                # For recon_input, use single frame with input parameters
-                recon_input_out = self._render_multiple_frames(
-                    latent_points=single_latent_points,
-                    query_points=single_query_points,
-                    inf_flame_params=input_flame_params,
-                    c2ws=input_c2ws,
-                    intrs=input_intrs,
-                    bg_colors=input_bg_colors,
-                    render_h=render_h,
-                    render_w=render_w,
-                    N_inf=N_input,
-                    input_indices=[single_frame_idx]
-                )
-                out['recon_input_comp_rgb'] = recon_input_out['comp_rgb']
-                out['recon_input_comp_mask'] = recon_input_out['comp_mask']
-                
-                # Clean up single frame variables
-                del recon_input_out
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                out['recon_input_comp_rgb'] = None
-                out['recon_input_comp_mask'] = None
-
-        # Add tracking outputs only if tracking is enabled
-        if self.use_tracking and track_list is not None:
-            out['track_list'] = track_list[-1]
-            out['vis'] = vis
-            out['track_conf'] = track_conf
-        else:
-            out['track_list'] = None
-            out['vis'] = None
-            out['track_conf'] = None
-            
-        # Add confidence output only if confidence is enabled
-        if self.use_confidence:
-            out['conf'] = conf
-        else:
-            out['conf'] = None
-            
-        out['num_input_frames'] = N_input
-        
-        # Clean up temporary variables
-        del single_latent_points, single_query_points
-        if self.use_multi_frame_pc:
-            del sliced_latent_points, sliced_query_points
-        del latent_points, query_points  # Clean up the original large tensors
-        
-        # Final memory cleanup
+        # Clean up (same as forward)
+        del latent_points_reshaped, query_points_reshaped, latent_points
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
-        return out
-    
-    @torch.no_grad()
-    def infer_images(self, image, input_c2ws, input_intrs, target_c2ws, target_intrs, target_bg_colors, input_flame_params, inf_flame_params, render_h=512, render_w=512):
-        B, N_input = image.shape[:2]
-        N_target = target_c2ws.shape[1]
-        
-        print(f"[INFER] Processing {N_input} input frames, {N_target} target views")
-        print(f"[INFER] Render resolution: {render_h}x{render_w}")
-        
-        modeling_time = time.time()
-        # Step 1: Get query points
-        query_points, _ = self.renderer.get_query_points(input_flame_params, device=image.device)
-        
-        # Step 2: Forward latent points (most expensive step)
-        # Construct camera parameters dictionary for INPUT frames (for encoder)
-        camera_params = {
-            'c2w': input_c2ws,
-            'intrinsic': input_intrs
-        }
-        latent_points, _ = self.forward_latent_points(image, query_points=query_points, flame_params=input_flame_params, camera_params=camera_params)
-        
-        modeling_time = time.time() - modeling_time
-
-        query_points = query_points.reshape(B, -1, query_points.shape[-1])
-        latent_points = latent_points.reshape(B, -1, latent_points.shape[-1])
-
-        # Use inf_flame_params directly without modification (like in inference code)
-        batch_flame_params = inf_flame_params.copy()
-        
-        latent_points = latent_points.float()
-        query_points = query_points.float()
-        batch_c2ws = target_c2ws.float() 
-        batch_intrs = target_intrs.float()
-        batch_bg_colors = target_bg_colors.float()
-        batch_flame_params = {k: v.float() if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch_flame_params.items()}
-        
-        # Handle multi-frame point cloud concatenation
-        if self.use_multi_frame_pc and N_input > 1:
-            # Multi-frame mode: concatenate all frames' latent points
-            # Check if latent_points is still 4D before reshaping
-            if len(latent_points.shape) == 4:
-                B_all, N_frames, N_points, C = latent_points.shape
-                latent_points = latent_points.reshape(B_all, N_frames * N_points, C)
-                query_points = query_points.reshape(B_all, N_frames * N_points, 3)
-        else:
-            # Single-frame mode: use only the first frame
-            if N_input > 1:
-                if len(latent_points.shape) == 4:
-                    latent_points = latent_points[:, 0]  # [B, N_points, C]
-                    query_points = query_points[:, 0]    # [B, N_points, 3]
-
-        render_start = time.time()
-
-        gs_model_list, curr_query_points, curr_flame_params, _ = self.renderer.forward_gs(
-            gs_hidden_features=latent_points, 
-            query_points=query_points, 
-            flame_data=input_flame_params
-        )
-        
-        render_res = self.renderer.forward_animate_gs(
-            gs_model_list, 
-            curr_query_points, 
-            batch_flame_params, 
-            batch_c2ws,
-            batch_intrs, 
-            render_h, 
-            render_w, 
-            batch_bg_colors,
-            num_input_frames=N_input
-        )
-        
-        total_render_time = time.time() - render_start
         
         # Store timing information in output
-        out = render_res
-        out['total_render_time'] = total_render_time
+        out['modeling_time'] = modeling_time
+        out['render_time'] = render_time
         
-        out = render_res
+        # Reshape comp_rgb: [B, N_target, H, W, C] -> [N_target, H, W, 3]
         if "comp_rgb" in out and isinstance(out["comp_rgb"], torch.Tensor):
-            # Reshape if needed: [B, Nv, 3, H, W] -> [Nv, H, W, 3]
             if len(out["comp_rgb"].shape) == 5:
                 out["comp_rgb"] = out["comp_rgb"][0].permute(0, 2, 3, 1)
-        if "comp_mask" in out and isinstance(out["comp_mask"], torch.Tensor):
-            if len(out["comp_mask"].shape) == 5:
-                out["comp_mask"] = out["comp_mask"][0].permute(0, 2, 3, 1)
-        if "comp_depth" in out and isinstance(out["comp_depth"], torch.Tensor):
-            if len(out["comp_depth"].shape) == 5:
-                out["comp_depth"] = out["comp_depth"][0].permute(0, 2, 3, 1)
-        
-        out['cano_gs_lst'] = gs_model_list
-
-        out['modeling_time'] = modeling_time
-        out['render_time'] = total_render_time
         
         return out

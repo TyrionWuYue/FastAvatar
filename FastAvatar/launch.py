@@ -13,6 +13,9 @@
 # limitations under the License.
 
 
+import os
+# Helps with memory fragmentation in PyTorch's memory allocator.
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import argparse
 

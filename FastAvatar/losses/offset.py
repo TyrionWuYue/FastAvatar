@@ -22,7 +22,7 @@ class Heuristic_ACAP_Loss(nn.Module):
     def __init__(self, group_dict, group_body_mapping):
         super(Heuristic_ACAP_Loss, self).__init__()
 
-        self.group_dict = group_dict  # register weights for different body parts
+        self.group_dict = group_dict  # register weights fro different body parts
         self.group_body_mapping = group_body_mapping  # mapping of body parts to group
 
     def _heurisitic_loss(self, _offset_loss):

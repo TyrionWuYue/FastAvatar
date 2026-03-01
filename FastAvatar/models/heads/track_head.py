@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch.nn as nn
-from FastAvatar.models.heads.dpt_head import DPTHead
-from FastAvatar.models.track_modules.base_track_predictor import BaseTrackerPredictor
+from FastAvatar.models.utils.dpt_head import DPTHead
+from FastAvatar.models.utils.track_modules.base_track_predictor import BaseTrackerPredictor
 
 
 class TrackHead(nn.Module):
@@ -26,8 +26,7 @@ class TrackHead(nn.Module):
         corr_levels=7,
         corr_radius=4,
         hidden_size=384,
-        intermediate_layer_idx=[2, 4, 6, 8],
-        use_flame_tokens=False
+        intermediate_layer_idx=[2, 4, 6, 8]
     ):
         """
         Initialize the TrackHead module.
@@ -56,8 +55,7 @@ class TrackHead(nn.Module):
             feature_only=True,  # Only output features, no activation
             down_ratio=2,  # Reduces spatial dimensions by factor of 2
             pos_embed=False,
-            intermediate_layer_idx = intermediate_layer_idx,
-            use_flame_tokens=use_flame_tokens
+            intermediate_layer_idx = intermediate_layer_idx
         )
 
         # Tracker module that predicts point trajectories
@@ -95,7 +93,6 @@ class TrackHead(nn.Module):
         B, S, _, H, W = images.shape
 
         # Extract features from tokens
-        # feature_maps has shape (B, S, C, H//2, W//2) due to down_ratio=2
         feature_maps = self.feature_extractor(aggregated_tokens_list, images, patch_start_idx)
 
         # Use default iterations if not specified

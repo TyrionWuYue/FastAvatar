@@ -15,13 +15,14 @@ inverse_sigmoid = lambda x: np.log(x / (1 - x))
 
 
 class GaussianModel:
-    def __init__(self, xyz=None, opacity=None, rotation=None, scaling=None, shs=None, offset=None, ply_path=None, sh2rgb=False) -> None:
+    def __init__(self, xyz=None, opacity=None, rotation=None, scaling=None, shs=None, offset=None, importance=None, ply_path=None, sh2rgb=False) -> None:
         self.xyz: Tensor = xyz
         self.opacity: Tensor = opacity
         self.rotation: Tensor = rotation
         self.scaling: Tensor = scaling
         self.shs: Tensor = shs
         self.offset: Tensor = offset
+        self.importance: Tensor = importance
 
         self.active_sh_degree = 0
         self._features_dc = torch.empty(0)  
@@ -52,6 +53,8 @@ class GaussianModel:
         self.scaling = self.scaling.cuda()
         self.shs = self.shs.cuda()
         self.offset = self.offset.cuda()
+        if self.importance is not None:
+            self.importance = self.importance.cuda()
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']

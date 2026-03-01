@@ -9,10 +9,10 @@ from FastAvatar.datasets.base import FrameBaseDataset
 from FastAvatar.utils.proxy import no_proxy
 from typing import Optional, Union
 
-__all__ = ['DisorderVideoHeadDataset']
+__all__ = ['NersembleDataset']
 
 
-class DisorderVideoHeadDataset(FrameBaseDataset):
+class NersembleDataset(FrameBaseDataset):
 
     """
     Structure of the dataset:
@@ -31,7 +31,7 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
         'rotation': [N, 3]
         'neck_pose': [N, 3]
         'jaw_pose': [N, 3]
-        'eyes_pose': [N, 3]
+        'eyes_pose': [N, 6]
         'translation': [N, 3]
         'shape': [N, 300]  # Identity parameters - same values repeated N times
         'expr': [N, 100]  # Expression parameters - can vary per frame
@@ -44,12 +44,11 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
                  render_image_res: int,
                  source_image_res: int,
                  disorder=True,
-                 repeat_num=1,
                  aspect_standard=1.0,  # h/w
                  is_val=False,
                  val_num=64,
+                 val_id=None,
                  use_teeth=False,
-                 teeth_bs_flag=False,
                  **kwargs):
         
         """
@@ -60,6 +59,8 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
             source_image_res: Source image resolution
             disorder: Whether to randomly sample frames or use sequential frames
             sequence_list_path: Path to json file containing list of sequences to use
+            val_id: List of IDs for validation. If None or empty, randomly select 5 IDs
+            val_num: Number of samples to select from validation IDs
         """
         super().__init__(
             root_dir=root_dirs,
@@ -73,19 +74,102 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
         self.source_image_res = source_image_res
         self.aspect_standard = aspect_standard
         self.disorder = disorder
-        self.uids = self.uids * repeat_num
         self.is_val = is_val
         self.use_random_input = kwargs.get("use_random_input", True)  # Add switch for random input frames
         self.use_teeth = use_teeth
-        self.teeth_bs_flag = teeth_bs_flag
         
-
-
-        val_indices = random.sample(range(len(self.uids)), val_num)
-        if self.is_val:
-            self.uids = [self.uids[i] for i in val_indices]
+        # Split train/val based on val_id
+        self._split_train_val(val_num, val_id)
+    
+    @staticmethod
+    def _extract_id_from_path(path: str) -> str:
+        """Extract ID from path. For nersemble, ID is the first part of path."""
+        # path format: "sequence_name/person_id" or "sequence_name"
+        parts = path.split('/')
+        return parts[0] if len(parts) > 0 else path
+    
+    def _split_train_val(self, val_num: int, val_id: Optional[list]):
+        """Split dataset into train/val based on val_id list."""
+        if val_id is None:
+            val_id = []
+        
+        # Get all unique IDs from uids
+        all_ids = set()
+        id_to_uids = {}
+        for idx, (path, frame_data) in enumerate(self.uids):
+            uid_id = self._extract_id_from_path(path)
+            all_ids.add(uid_id)
+            if uid_id not in id_to_uids:
+                id_to_uids[uid_id] = []
+            id_to_uids[uid_id].append(idx)
+        
+        # Determine which IDs to use for validation
+        if len(val_id) == 0:
+            # Randomly select 5 IDs if val_id is empty
+            # Use fixed seed to ensure consistency across all processes/GPUs
+            available_ids = sorted(list(all_ids))  # Sort for deterministic order
+            if len(available_ids) < 5:
+                selected_ids = available_ids
+            else:
+                # Use fixed seed for reproducible validation set selection
+                rng = random.Random(42)  # Fixed seed
+                selected_ids = rng.sample(available_ids, 5)
+            print(f"No val_id specified, randomly selected {len(selected_ids)} IDs for validation (with fixed seed): {selected_ids}")
         else:
-            self.uids = [self.uids[i] for i in range(len(self.uids)) if i not in val_indices]
+            # Use specified val_id, filter out non-existent ones
+            selected_ids = [uid for uid in val_id if uid in all_ids]
+            missing_ids = [uid for uid in val_id if uid not in all_ids]
+            if missing_ids:
+                print(f"Warning: Some val_id not found in dataset: {missing_ids}")
+            if len(selected_ids) == 0:
+                print(f"Warning: No valid val_id found, using all IDs")
+                selected_ids = list(all_ids)
+            else:
+                print(f"Using {len(selected_ids)} specified IDs for validation: {selected_ids}")
+        
+        # Collect all UID indices for validation IDs
+        val_uid_indices = []
+        for uid_id in selected_ids:
+            val_uid_indices.extend(id_to_uids[uid_id])
+        
+        # Sample val_num samples from validation UIDs
+        if self.is_val:
+            # Categorize samples by camera type (multi-view vs monocular)
+            multi_view_indices = []
+            monocular_indices = []
+            
+            for idx in val_uid_indices:
+                path, frame_data = self.uids[idx]
+                cameras = set([pair['camera'] for pair in frame_data['data']])
+                if len(cameras) > 1:
+                    multi_view_indices.append(idx)
+                else:
+                    monocular_indices.append(idx)
+            
+            # Sample balanced validation set
+            half_val = val_num // 2
+            
+            if len(multi_view_indices) >= half_val:
+                selected_multi = random.sample(multi_view_indices, half_val)
+            else:
+                selected_multi = multi_view_indices
+                print(f"Warning: Only {len(multi_view_indices)} multi-view samples available, wanted {half_val}")
+            
+            if len(monocular_indices) >= half_val:
+                selected_mono = random.sample(monocular_indices, half_val)
+            else:
+                selected_mono = monocular_indices
+                print(f"Warning: Only {len(monocular_indices)} monocular samples available, wanted {half_val}")
+            
+            val_uid_indices = selected_multi + selected_mono
+            self.uids = [self.uids[i] for i in val_uid_indices]
+            
+            print(f"Validation set: {len(selected_multi)} multi-view + {len(selected_mono)} monocular = {len(self.uids)} total samples from {len(selected_ids)} IDs")
+        else:
+            # Training set: exclude validation IDs
+            train_uid_indices = [i for i in range(len(self.uids)) if i not in val_uid_indices]
+            self.uids = [self.uids[i] for i in train_uid_indices]
+            print(f"Training set: {len(self.uids)} samples (excluded {len(selected_ids)} validation IDs)")
 
     @staticmethod
     def _load_pose(frame_info):
@@ -118,16 +202,21 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
         flame_param_tensor['shape'] = torch.FloatTensor(flame_param['shape'])
         return flame_param_tensor
     
-    def get_frame_info(self, path: str, frame_idx: int, camera_id: str):
+    def get_frame_info(self, path: str, frame_idx: int, camera_id: str, sequence_name: str = None):
         """Get frame info from transforms.json file at the camera directory level.
         Args:
             path: Path to the sequence/person directory
             frame_idx: Frame index
             camera_id: Camera ID
+            sequence_name: Sequence Name (optional)
         Returns:
             frame_info: Complete frame information from transforms.json
         """
-        camera_dir = os.path.join(self.root_dir, path, camera_id)
+        if sequence_name:
+            camera_dir = os.path.join(self.root_dir, path, camera_id, sequence_name)
+        else:
+            camera_dir = os.path.join(self.root_dir, path, camera_id)
+        
         transforms_json = os.path.join(camera_dir, "transforms.json")
         if not os.path.exists(transforms_json):
             raise FileNotFoundError(f"transforms.json not found at {transforms_json}")
@@ -172,31 +261,36 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
         input_frames = frame_data.get("input_frames", self.max_input_frames)  # Use pre-defined input_frames
         
         # Extract base path (remove group_id from path)
-        # path format: "sequence_name/person_id/group_id"
+        # path format: "person_id/camera_id/sequence_name/group_id"
         path_parts = path.split('/')
         base_path = '/'.join(path_parts[:-1])  # Remove group_id
        
-        # Always load max_input_frames + target_frames pairs
-        total_frames_needed = self.max_input_frames + self.target_frames
+        # Load exactly input_frames + target_frames pairs (not max_input_frames)
+        total_frames_needed = input_frames + self.target_frames
         if len(camera_frame_pairs) > total_frames_needed:
             rng = np.random.RandomState(idx)
             start_idx = rng.randint(0, len(camera_frame_pairs) - total_frames_needed + 1)
             camera_frame_pairs = camera_frame_pairs[start_idx:start_idx + total_frames_needed]
         elif len(camera_frame_pairs) < total_frames_needed:
             raise ValueError(f"Not enough camera-frame pairs available. Need {total_frames_needed} pairs but only have {len(camera_frame_pairs)}")
-        
+
         # Load data for each camera-frame pair
         c2ws, intrs, rgbs, bg_colors, masks, landmarks_list = [], [], [], [], [], []
-        
+
         for i, pair in enumerate(camera_frame_pairs):
             camera_id = pair["camera"]
             frame_idx = pair["frame"]
+            sequence_name = pair.get("seq")
             
             # Get complete frame info from transforms.json
-            frame_info = self.get_frame_info(base_path, frame_idx, camera_id)
+            frame_info = self.get_frame_info(base_path, frame_idx, camera_id, sequence_name=sequence_name)
             
             # Build frame directory path
-            frame_dir = os.path.join(self.root_dir, base_path, camera_id, "processed_data", f"{frame_idx:05d}")
+            # base_path already includes person_id/camera_id/sequence_name
+            if sequence_name:
+                frame_dir = os.path.join(self.root_dir, base_path, camera_id, sequence_name, "processed_data", f"{frame_idx:05d}")
+            else:
+                frame_dir = os.path.join(self.root_dir, base_path, "processed_data", f"{frame_idx:05d}")
             
             # Load processed data
             rgb, mask, intrinsic, landmarks, bg_color = self.load_processed_data(frame_dir)
@@ -229,12 +323,15 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
         for i, pair in enumerate(camera_frame_pairs):
             camera_id = pair["camera"]
             frame_idx = pair["frame"]
+            sequence_name = pair.get("seq")
             
             # Load FLAME parameters
-            flame_path = os.path.join(self.root_dir, base_path, camera_id, "flame_param", f"{frame_idx:05d}.npz")
-            
-            # For teeth_bs, we need to check if it exists
-            teeth_bs_pth = os.path.join(self.root_dir, base_path, camera_id, "tracked_teeth_bs.npz")
+            if sequence_name:
+                flame_path = os.path.join(self.root_dir, base_path, camera_id, sequence_name, "flame_param", f"{frame_idx:05d}.npz")
+                teeth_bs_pth = os.path.join(self.root_dir, base_path, camera_id, sequence_name, "tracked_teeth_bs.npz")
+            else:
+                flame_path = os.path.join(self.root_dir, base_path, camera_id, "flame_param", f"{frame_idx:05d}.npz")
+                teeth_bs_pth = os.path.join(self.root_dir, base_path, camera_id, "tracked_teeth_bs.npz")
             if os.path.exists(teeth_bs_pth) and self.use_teeth:
                 teeth_bs_lst = np.load(teeth_bs_pth)['expr_teeth']
                 teeth_bs = teeth_bs_lst[frame_idx] if teeth_bs_lst is not None and frame_idx < len(teeth_bs_lst) else None
@@ -252,88 +349,49 @@ class DisorderVideoHeadDataset(FrameBaseDataset):
         
         # Load canonical flame parameters (use first camera for consistency)
         first_camera_id = camera_frame_pairs[0]["camera"]
-        canonical_flame_path = os.path.join(self.root_dir, base_path, first_camera_id, "canonical_flame_param.npz")
+        first_seq = camera_frame_pairs[0].get("seq")
+        if first_seq:
+            canonical_flame_path = os.path.join(self.root_dir, base_path, first_camera_id, first_seq, "canonical_flame_param.npz")
+        else:
+            canonical_flame_path = os.path.join(self.root_dir, base_path, first_camera_id, "canonical_flame_param.npz")
         canonical_flame_param = self.load_flame_params(canonical_flame_path, 0, None)
         all_flame_params['betas'] = canonical_flame_param['shape'].expand(len(camera_frame_pairs), -1)  # [N, 300]
 
         ret = {
             'uid': uid,
-            'c2ws': c2ws[:-self.target_frames],
+            'c2ws': c2ws[:input_frames],  # Use actual input_frames instead of max_input_frames
             'target_c2ws': c2ws[-self.target_frames:],
-            'intrs': intrs[:-self.target_frames],
+            'intrs': intrs[:input_frames],
             'target_intrs': intrs[-self.target_frames:],
-            'rgbs': rgbs[:-self.target_frames],
+            'rgbs': rgbs[:input_frames],
             'target_rgbs': rgbs[-self.target_frames:],
-            'bg_colors': bg_colors[:-self.target_frames],
+            'bg_colors': bg_colors[:input_frames],
             'target_bg_colors': bg_colors[-self.target_frames:],
-            'masks': masks[:-self.target_frames],
+            'masks': masks[:input_frames],
             'target_masks': masks[-self.target_frames:],
-            'landmarks': landmarks[:-self.target_frames],
+            'landmarks': landmarks[:input_frames],
             'target_landmarks': landmarks[-self.target_frames:],
             'max_input_frames': self.max_input_frames,
-            'input_frames': input_frames,  # Add pre-defined input_frames
+            'input_frames': input_frames,
             'is_val': self.is_val,
         }
         
         for k, v in all_flame_params.items():
-            ret[f'input_{k}'] = v[:-self.target_frames]  # [N_input, ...]
+            ret[f'input_{k}'] = v[:input_frames]  # [N_input, ...] - use actual input_frames
             ret[f'target_{k}'] = v[-self.target_frames:]  # [N_target, ...]
         
-        assert ret['c2ws'].shape[0] == self.max_input_frames
+        # Verify correct tensor shapes
+        assert ret['c2ws'].shape[0] == input_frames, f"c2ws shape: {ret['c2ws'].shape}, expected: {input_frames}"
         assert ret['target_c2ws'].shape[0] == self.target_frames
-        assert ret['intrs'].shape[0] == self.max_input_frames
+        assert ret['intrs'].shape[0] == input_frames
         assert ret['target_intrs'].shape[0] == self.target_frames
-        assert ret['rgbs'].shape[0] == self.max_input_frames, f"{ret['rgbs'].shape}"
+        assert ret['rgbs'].shape[0] == input_frames
         assert ret['target_rgbs'].shape[0] == self.target_frames
-        assert ret['bg_colors'].shape[0] == self.max_input_frames
-        assert ret['target_bg_colors'].shape[0] == self.target_frames
-        assert ret['masks'].shape[0] == self.max_input_frames
+        assert ret['bg_colors'].shape[0] == input_frames
+        assert ret['masks'].shape[0] == input_frames
         assert ret['target_masks'].shape[0] == self.target_frames
-        assert ret['landmarks'].shape[0] == self.max_input_frames
+        assert ret['landmarks'].shape[0] == input_frames
         assert ret['target_landmarks'].shape[0] == self.target_frames
 
         return ret
 
-
-# Global seed counter is no longer needed since input_frames is pre-defined in the dataset
-
-def collate_fn(batch):
-    """Collate function for DataLoader to handle batch-level input frames.
-    
-    Args:
-        batch: List of samples from dataset
-        
-    Returns:
-        Collated batch with consistent input frames
-    """
-    # Use pre-defined input_frames from the first sample
-    # All samples in a batch should have the same input_frames
-    input_frames = batch[0].get('input_frames', batch[0]['max_input_frames'])
-
-    # Process each sample in the batch
-    processed_batch = []
-    for sample in batch:
-        # Get the actual frames we need for input parameters
-        sample['rgbs'] = sample['rgbs'][:input_frames]
-        sample['landmarks'] = sample['landmarks'][:input_frames]
-        sample['c2ws'] = sample['c2ws'][:input_frames]
-        sample['intrs'] = sample['intrs'][:input_frames]
-        sample['bg_colors'] = sample['bg_colors'][:input_frames]
-        sample['masks'] = sample['masks'][:input_frames]
-        
-        for key in list(sample.keys()):
-            if key.startswith('input_'):
-                if isinstance(sample[key], torch.Tensor) and sample[key].shape[0] > input_frames:
-                    sample[key] = sample[key][:input_frames]
-        
-        processed_batch.append(sample)
-
-    # Stack all tensors
-    collated = {}
-    for key in processed_batch[0].keys():
-        if isinstance(processed_batch[0][key], torch.Tensor):
-            collated[key] = torch.stack([sample[key] for sample in processed_batch])
-        else:
-            collated[key] = [sample[key] for sample in processed_batch]
-    
-    return collated
