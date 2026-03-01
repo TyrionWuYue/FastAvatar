@@ -70,6 +70,11 @@ rm -r ./tmp/
 huggingface-cli download TyrionWuY/FastAvatar --local-dir ./model_zoo/fastavatar/
 ```
 
+### Train
+```bash
+bash scripts/train/train.sh
+```
+
 ### Inference
 ```bash
 bash scripts/infer/infer.sh ${CONFIG} ${MODEL_NAME} ${IMAGE_INPUT} ${MOTION_SEQS_DIR} ${INFERENCE_N_FRAMES} ${MODE}

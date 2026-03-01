@@ -604,7 +604,7 @@ def launch(input_base_path: str, output_base_path: str, action_seq: str = None, 
 
 def test_collect_tasks():
     """Test function to verify task collection works with the new structure."""
-    input_base_path = "/inspire/hdd/project/powersystem/fengkairui-25026/wuyue/data/nersemble_data/nersemble_data"
+    input_base_path = "YOUR_DATA_PATH"
     output_base_path = "/tmp/test_output"
 
     # Test collecting tasks

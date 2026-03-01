@@ -48,7 +48,7 @@ model:
     fix_rotation: false
     teeth_bs_flag: false
     oral_mesh_flag: true
-    gs_pruning: false
+    gs_pruning: true
     rendering_chunk_size_train: 16
     rendering_chunk_size_infer: 128
 
@@ -66,11 +66,11 @@ dataset:
     meta_path: "./datasets/mixed_uids.json"
     datasets:
         nersemble:
-            root_dir: "/inspire/qb-ilm/project/urbanlowaltitude/fengkairui-25026/wuyue/data/NersembleFLAME"
+            root_dir: YOUR_DATA_PATH
             task_type: "unified"
             val_id: [] # '309', '146', '123', '370', '204'
         vfhq:
-            root_dir: "/inspire/qb-ilm/project/urbanlowaltitude/fengkairui-25026/wuyue/data/VFHQFLAME"
+            root_dir: YOUR_DATA_PATH
             task_type: "monocular"
             val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
     render_image:
@@ -88,7 +88,7 @@ train:
         ssim_weight: 0.1
         offset_weight: 0.1
         tracking_weight: 0.01
-        pruning_weight: -1 # 0.0005
+        pruning_weight: 0.0005
         identity_weight: 0.1
         arcface_checkpoint: "./model_zoo/arcface/arcface_checkpoint.tar"
     optim:

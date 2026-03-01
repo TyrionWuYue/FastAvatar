@@ -748,8 +748,8 @@ class TrackingVideoImage:
    
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
-    video_input_path ='/inspire/hdd/project/powersystem/fengkairui-25026/wuyue/data/nersemble_data/nersemble_data/sequence_EXP-5-mouth_part-4/237/EXP-5-mouth/cam_222200037.mp4' 
-    result_save_path = "/inspire/hdd/project/powersystem/fengkairui-25026/wuyue/project/FastAvatarpp_train/trail"
+    video_input_path ='VIDEO_PATH' 
+    result_save_path = "TARGET_PATH"
     gpu_id = 0
     image_size = 512
     target_fps = 3

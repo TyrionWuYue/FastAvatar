@@ -42,29 +42,28 @@ class FastAvatarTrainer(Trainer):
         return model
 
     def _build_optimizer(self, model, cfg):
-        logger.info("======== Learning Rate Configuration ========")
-        lr = getattr(cfg.train.optim, 'lr', 1e-5)
-
-        # Single group: encoder, transformer, pcl_embed, renderer (no prediction heads)
-        params = list(model.encoder.parameters())
-        params.extend(list(model.transformer.parameters()))
-        params.extend(list(model.pcl_embed.parameters()))
-        for name, p in model.renderer.named_parameters():
-            if name.startswith('flame_model.'):
+        all_params = []
+        total_params = 0
+        
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
                 continue
-            if name.startswith('mlp_net.') or name.startswith('gs_net.'):
-                params.append(p)
-        if model.framepack_compressor is not None:
-            params.extend(list(model.framepack_compressor.parameters()))
-        logger.info(f"  Total: {sum(p.numel() for p in params):,} params (lr={lr:.2e})")
-
+            
+            all_params.append(p)
+            total_params += p.numel()
+        
+        lr = getattr(cfg.train.optim, 'lr', 5e-5)
+        
+        logger.info("======== Learning Rate Configuration ========")
+        logger.info(f"  Total trainable parameters: {total_params:,}")
+        logger.info(f"  Learning rate: {lr:.2e}")
+        
         optimizer = torch.optim.AdamW(
-            params,
+            all_params,
             lr=lr,
             weight_decay=cfg.train.optim.weight_decay,
-            betas=(cfg.train.optim.beta1, cfg.train.optim.beta2)
+            betas=(cfg.train.optim.beta1, cfg.train.optim.beta2),
         )
-
         return optimizer
     
     def _build_scheduler(self, optimizer, cfg):
@@ -228,19 +227,21 @@ class FastAvatarTrainer(Trainer):
         loss_r_offset = None
         loss_r_pruning = None
         loss_r_id = None
+        
+        comp_rgb = outputs['comp_rgb']
 
         if self.cfg.train.loss.pixel_weight > 0.:
-            loss_r_pixel = self.pixel_loss_fn(rgb_gt_pose, target_image)
+            loss_r_pixel = self.pixel_loss_fn(comp_rgb, target_image)
             loss_renderer += loss_r_pixel * self.cfg.train.loss.pixel_weight
 
         if self.cfg.train.loss.perceptual_weight > 0.:
             with torch.autocast("cuda", enabled=False):
-                loss_r_perceptual = self.perceptual_loss_fn(rgb_gt_pose, target_image)
+                loss_r_perceptual = self.perceptual_loss_fn(comp_rgb, target_image)
                 loss_renderer += loss_r_perceptual * self.cfg.train.loss.perceptual_weight
 
         if self.cfg.train.loss.ssim_weight > 0.:
             with torch.autocast("cuda", enabled=False):
-                loss_r_ssim = self.ssim_loss_fn(rgb_gt_pose, target_image)
+                loss_r_ssim = self.ssim_loss_fn(comp_rgb, target_image)
                 loss_renderer += loss_r_ssim * self.cfg.train.loss.ssim_weight
         
         if self.cfg.train.loss.offset_weight > 0. and 'offsets' in outputs:
@@ -257,7 +258,7 @@ class FastAvatarTrainer(Trainer):
             loss_renderer += loss_r_pruning ** 2 * self.cfg.train.loss.pruning_weight
 
         if getattr(self.cfg.train.loss, 'identity_weight', 0.0) > 0.:
-            loss_r_id = self.id_loss_fn(rgb_gt_pose, target_image)
+            loss_r_id = self.id_loss_fn(comp_rgb, target_image)
             loss_renderer += loss_r_id * self.cfg.train.loss.identity_weight
 
         total_loss = loss_renderer
@@ -358,6 +359,8 @@ class FastAvatarTrainer(Trainer):
                 # GS stats
                 if not math.isnan(get_val('avg_remaining_gs')):
                     step_info += f"GS:{get_val('avg_remaining_gs')/1000:.1f}K "
+                if not math.isnan(get_val('prune_percentage')):
+                    step_info += f"Prune:{get_val('prune_percentage'):.1f}% "
                 # LR
                 step_info += f"lr:{self.optimizer.param_groups[0]['lr']:.2e}"
                 
@@ -466,7 +469,7 @@ class FastAvatarTrainer(Trainer):
                     step=self.global_step if epoch is None else None,
                     batch_idx=batch_idx,
                     gts=data['target_rgbs'][:n].cpu(),
-                    renders_gt_pose=outs['comp_rgb_gt_pose'][:n].cpu(),
+                    renders=outs['comp_rgb'][:n].cpu(),
                     uids=data['uid'],
                 )
 
@@ -522,10 +525,10 @@ class FastAvatarTrainer(Trainer):
     @Trainer.control('on_main_process')
     def save_val_images(
         self, epoch: int = None, step: int = None, batch_idx: int = None,
-        gts: torch.Tensor = None, renders_gt_pose: torch.Tensor = None,
+        gts: torch.Tensor = None, renders: torch.Tensor = None,
         uids: list = None,
         ):
-        """Save validation images: 2 rows — GT, Rendered (GT Cam+GT FLAME)"""
+        """Save validation images: 2 rows — GT, Rendered"""
         import os
         from torchvision.utils import save_image
         
@@ -543,10 +546,10 @@ class FastAvatarTrainer(Trainer):
         num_samples = gts.shape[0]
 
         for sample_idx in range(num_samples):
-            # 2 rows: GT | Rendered (GT Cam+GT FLAME)
+            # 2 rows: GT | Rendered
             rows = [gts[sample_idx]]
-            if renders_gt_pose is not None:
-                rows.append(renders_gt_pose[sample_idx])
+            if renders is not None:
+                rows.append(renders[sample_idx])
 
             merged = torch.stack(rows, dim=0).view(-1, *gts.shape[2:])  # [N_rows*M, C, H, W]
             nrow = M

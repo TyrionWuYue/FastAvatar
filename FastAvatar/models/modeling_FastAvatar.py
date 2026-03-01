@@ -423,8 +423,6 @@ class ModelFastAvatar(nn.Module):
             bg_colors=target_bg_colors,
             **render_kwargs
         )
-        out['comp_rgb_gt_pose'] = out['comp_rgb']
-        out['comp_rgb_pred_pose'] = out['comp_rgb']
         
         del input_c2ws, target_c2ws, input_intrs, target_intrs, landmarks, input_flame_params, latent_flat, query_flat
         if torch.cuda.is_available():
@@ -473,22 +471,6 @@ class ModelFastAvatar(nn.Module):
         )
         render_time = time.time() - render_start
 
-        # # Old implementation: Render directly using renderer
-        # render_start = time.time()
-        # out = self.renderer(
-        #     gs_hidden_features=latent_points_reshaped,
-        #     query_points=query_points_reshaped,
-        #     flame_data=inf_flame_params,
-        #     c2w=target_c2ws,
-        #     intrinsic=target_intrs,
-        #     height=render_h,
-        #     width=render_w,
-        #     background_color=target_bg_colors,
-        #     num_input_frames=num_input_frames,
-        # )
-        # render_time = time.time() - render_start
-
-        # Clean up (same as forward)
         del latent_points_reshaped, query_points_reshaped, latent_points
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
