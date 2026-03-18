@@ -15,6 +15,14 @@
     <img src="./assets/images/teaser.png" width="100%">
 </p>
 
+```bibtex
+@inproceedings{wufastavatar,
+  title={FastAvatar: Towards Unified and Fast 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers},
+  author={Wu, Yue and Chen, Xuanhong and Wu, Yufan and Li, Wen and Lu, Yuxi and Feng, Kairui},
+  booktitle={The Fourteenth International Conference on Learning Representations}
+}
+```
+
 ## 📢 News
 - **[2026/03/01]** 🚀 Released new model weights and training code.
 - **[2026/01/26]** 🎉🎉🎉 Accepted to ICLR 2026.
@@ -90,11 +98,3 @@ This work is built on many amazing research works and open-source projects:
 - [VHAP](https://github.com/ShenhanQian/VHAP)
 
 Thanks for their excellent works and great contribution.
-
-```bibtex
-@inproceedings{wufastavatar,
-  title={FastAvatar: Towards Unified and Fast 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers},
-  author={Wu, Yue and Chen, Xuanhong and Wu, Yufan and Li, Wen and Lu, Yuxi and Feng, Kairui},
-  booktitle={The Fourteenth International Conference on Learning Representations}
-}
-```
