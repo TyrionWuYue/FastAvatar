@@ -92,13 +92,9 @@ This work is built on many amazing research works and open-source projects:
 Thanks for their excellent works and great contribution.
 
 ```bibtex
-@misc{wu2025fastavatarunifiedfasthighfidelity,
-      title={FastAvatar: Towards Unified Fast High-Fidelity 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers}, 
-      author={Yue Wu and Yufan Wu and Wen Li and Yuxi Lu and Kairui Feng and Xuanhong Chen},
-      year={2025},
-      eprint={2508.19754},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2508.19754}, 
+@inproceedings{wufastavatar,
+  title={FastAvatar: Towards Unified and Fast 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers},
+  author={Wu, Yue and Chen, Xuanhong and Wu, Yufan and Li, Wen and Lu, Yuxi and Feng, Kairui},
+  booktitle={The Fourteenth International Conference on Learning Representations}
 }
 ```
