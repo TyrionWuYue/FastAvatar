@@ -16,10 +16,12 @@
 </p>
 
 ```bibtex
-@inproceedings{wufastavatar,
-  title={FastAvatar: Towards Unified and Fast 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers},
-  author={Wu, Yue and Chen, Xuanhong and Wu, Yufan and Li, Wen and Lu, Yuxi and Feng, Kairui},
-  booktitle={The Fourteenth International Conference on Learning Representations}
+@inproceedings{wu2026fastavatar,
+title={FastAvatar: Towards Unified and Fast 3D Avatar Reconstruction with Large Gaussian Reconstruction Transformers},
+author={Yue Wu and Xuanhong Chen and Yufan Wu and Wen Li and Yuxi Lu and Kairui Feng},
+booktitle={The Fourteenth International Conference on Learning Representations},
+year={2026},
+url={https://openreview.net/forum?id=P7zBSCs4Xt}
 }
 ```
 
