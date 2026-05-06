@@ -3,7 +3,7 @@
 <div align="center">
 <a href="https://tyrionwuyue.github.io/project_FastAvatar/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
 <a href="https://arxiv.org/abs/2508.19754"><img src="https://img.shields.io/badge/arXiv-2503.11651-b31b1b" alt="arXiv"></a>
-<a href="https://huggingface.co/TyrionWuY/FastAvatar"><img src="https://img.shields.io/badge/HuggingFace-Model_Weights-FFD21E?logo=huggingface&logoColor=000" alt="Hugging Face Model Weights"></a>
+<a href="https://huggingface.co/TyrionWuY/FastAvatar"><img src="https://img.shields.io/badge/Hugging%20Face-Model%20Weights-FFD21E?style=flat-square&logo=huggingface&logoColor=000" alt="Hugging Face Model Weights"></a>
 
 [Yue Wu](https://tyrionwuyue.github.io/), [Xuanhong Chen*](https://github.com/neuralchen), [Yufan Wu](https://github.com/EavianWoo), [Wen Li](https://github.com/lililuya),  [Yuxi Lu](orcid.org/0000-0003-1205-3524), [Kairui Feng](https://kelvinfkr.github.io/)
 
