@@ -177,7 +177,7 @@ class FastAvatarInferrer(Inferrer):
         if resume.endswith('.safetensors'):
             ckpt = load_file(resume, device='cpu')
         else:
-            ckpt = torch.load(resume, map_location='cpu')
+            ckpt = torch.load(resume, map_location='cpu', weights_only=True)
         
         # Load base model state dict
         model.load_state_dict(ckpt, strict=False)
